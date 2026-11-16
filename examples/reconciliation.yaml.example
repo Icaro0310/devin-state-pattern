@@ -28,20 +28,20 @@ reconciliation:
   # observe-only until a class has earned trust — auto-fix on top of a
   # wrong checker destroys real state.
   auto_fix:
-    drift-git:
+    drift_git:
       prune_orphan_worktrees_when_zero_diff: true
       drop_stashes_older_than_days: 7
       drop_when_zero_diff: true
-    drift-spec:
+    drift_spec:
       align_dev_venvs: true
       reinstall_uv_tools: true
-    drift-deps:
+    drift_deps:
       auto_rebase_when_older_than_hours: 72
-    drift-daemons:
+    drift_daemons:
       restart: false                     # observe-only: never restart services
-    drift-prs:
+    drift_prs:
       approve_if_green_and_queued_lt_minutes: 30
-    # drift-triggers intentionally absent — triggers are declared and
+    # drift_triggers intentionally absent — triggers are declared and
     # audited, never auto-installed or auto-removed.
 
   # Alerting — where violations go and how they are deduplicated so a

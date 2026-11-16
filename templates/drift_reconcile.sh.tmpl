@@ -17,8 +17,9 @@
 #     `enabled: false` stay declared but paused (better than deleting:
 #     the manifest still documents intent).
 #   - Session-scoped checkers (e.g. a compliance auditor that reads session
-#     transcripts) do NOT belong in the daily sweep — keep them out of
-#     `classes:` or give them a different filename prefix.
+#     transcripts) MAY belong in the sweep too — reconciliation.yaml
+#     `classes:` is the single source of truth for what runs when. Keep
+#     hook-only checkers out of `classes:` if they need session context.
 #
 # TODO(adopt):
 #   - ECOSYSTEM_ROOT defaults to the parent of this script's dir; override
