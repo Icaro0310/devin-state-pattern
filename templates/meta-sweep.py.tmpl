@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""meta-sweep — SKELETON: verify the verifiers.
+
+WHY this check exists
+---------------------
+Every drift_* reconciler is itself code that can be wrong: a regex that
+never matches, a probe that reads stale state, a fetch that silently
+times out. If the reconcilers are the only source of truth, "0
+violations" is an unverifiable claim — the same class of bug as a test
+suite that can't fail.
+
+The rule this enforces (declare it in your agent rules):
+
+    The reconciler reports. The meta-sweep verifies. The agent declares
+    "green" only when BOTH agree.
+
+For each drift class, meta-sweep re-measures reality through an
+INDEPENDENT path — different command, different parser, different data
+source where possible — then compares its measurement against the last
+entry that class wrote to ``drift.jsonl``. Discrepancy types::
+
+    real=X, drift=Y          — measurements disagree (one is wrong)
+    drift_entry_missing      — drift never covered this target
+    drift_never_ran / drift_stale — the class hasn't reported recently
+                               (temporal blindness: last entry may agree
+                               by accident while the checker is dead)
+
+Classes are isolated: each ``sweep_<class>`` runs inside a guard so one
+broken probe (bad YAML, API down) records ``sweep_error:<class>`` instead
+of blinding the whole sweep — the same fail-open discipline as the
+reconcilers themselves.
+
+Output contract: one record per discrepancy ``{ts, repo, issues, real,
+drift}`` plus a closing ``{"class": "meta-sweep", "discrepancies": N,
+"repos_with_issues": [...]}`` summary — the summary line is what alert
+consumers key on, so ALWAYS write it even when clean (an empty sweep
+must be distinguishable from a sweep that never ran; the "green within
+26h" rule depends on it).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append, iter_lines
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+DRIFT_JSONL = Path(os.environ.get("DRIFT_JSONL",
+                                 STATE_DIR / "drift.jsonl"))
+OUT_PATH = Path(os.environ.get("META_SWEEP_OUT",
+                              STATE_DIR / "meta-sweep.jsonl"))
+REPOS_YAML = Path(os.environ.get("REPOS_YAML",
+                                ECOSYSTEM_ROOT / "repos.yaml"))
+
+# Classes this sweep covers — must mirror the drift_* suite. A class not
+# listed here is unverified; add it when you add its reconciler.
+CLASSES = ["git"]  # TODO(adopt): + "deps", "daemons", "prs", "spec", ...
+DRIFT_MAX_AGE_H = float(os.environ.get("META_SWEEP_DRIFT_MAX_AGE_H", "30"))
+
+
+def sh(cmd, timeout: int = 30, shell: bool = False):
+    """Fail-open runner -> (rc, stdout, stderr). Never raises."""
+    return cmd_run(cmd, timeout=timeout, shell=shell)
+
+
+def parse_ts(s) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------- drift.jsonl I/O
+
+def load_drift_rows() -> list[dict]:
+    """All parsed entries of the drift ledger (append-only)."""
+    return list(iter_lines(DRIFT_JSONL))
+
+
+def latest_by_key(rows: list[dict], cls: str, keyfn) -> dict:
+    """{key: entry} — last entry per key. Append-only => last line wins;
+    older count>0 entries are history, not current state."""
+    out = {}
+    for r in rows:
+        if r.get("class") != cls:
+            continue
+        k = keyfn(r)
+        if k is not None:
+            out[k] = r
+    return out
+
+
+def freshness_records(rows: list[dict], now: datetime) -> list[dict]:
+    """One '<cls>:meta' record per class whose last drift entry is older
+    than DRIFT_MAX_AGE_H (or never ran).
+
+    Catches temporal blindness: if drift_deps crashed 3 days ago, each
+    repo's 'last entry' may still agree with reality by accident — the
+    entry's AGE is the signal, not its content."""
+    recs = []
+    for cls in CLASSES:
+        tslist = [t for t in (parse_ts(r.get("ts")) for r in rows
+                              if r.get("class") == cls) if t]
+        if not tslist:
+            recs.append({"ts": now.isoformat(), "repo": f"{cls}:meta",
+                         "issues": ["drift_never_ran"],
+                         "real": {}, "drift": {"last_ts": None}})
+            continue
+        last = max(tslist)
+        age_h = (now - last).total_seconds() / 3600
+        if age_h > DRIFT_MAX_AGE_H:
+            recs.append({"ts": now.isoformat(), "repo": f"{cls}:meta",
+                         "issues": [f"drift_stale:age={age_h:.1f}h"],
+                         "real": {"max_age_h": DRIFT_MAX_AGE_H},
+                         "drift": {"last_ts": last.isoformat()}})
+    return recs
+
+
+# ------------------------------------------------------------- per-class
+# Each sweep_<class>(rows, cfg) measures reality INDEPENDENTLY and
+# compares to the class's drift entries. Contract: (records, n_issues,
+# checked-info). Records carry {repo, issues, real, drift}.
+#
+# INDEPENDENCE is the whole point — do NOT import or shell out to the
+# drift_* script's own helpers:
+#   - git:      measure with different commands than drift_git (e.g.
+#               rev-list --count instead of log --oneline line counts)
+#   - deps/prs: gh api graphql instead of gh pr list, or a different
+#               JSON field set parsed your own way
+#   - spec:     read dist-info METADATA / regex the schema file instead
+#               of importing the package inside the env
+#   - daemons:  parse `systemctl list-units` output yourself instead of
+#               trusting is-active strings
+
+def measure_git_real(repo: dict) -> dict:
+    """Independent git measurement. TODO(adopt): rewrite using commands
+    DIFFERENT from drift-git.py.tmpl's — same reality, own code path."""
+    path = repo["path"]
+    if not os.path.isdir(path):
+        return {"error": "path_missing"}
+    return {}  # TODO(adopt): return your independent measurement dict
+
+
+def compare_git(name: str, real: dict, entry: dict | None) -> tuple:
+    """-> (issues, real_out). TODO(adopt): field-by-field comparison —
+    prefer the drift record's raw FIELDS over parsing its violation
+    strings (strings are a lossy view of the measurement)."""
+    issues = ["drift_entry_missing"] if entry is None else []
+    return issues, real
+
+
+def sweep_git(rows: list[dict], cfg: dict) -> tuple:
+    drift_map = latest_by_key(rows, "git", lambda r: r.get("repo"))
+    records, n_issues = [], 0
+    for repo in cfg.get("repos", []):
+        name = repo["name"]
+        real = measure_git_real(repo)
+        issues, real_out = compare_git(name, real,
+                                       drift_map.get(name))
+        if issues:
+            n_issues += len(issues)
+            records.append({"repo": name, "issues": issues,
+                            "real": real_out,
+                            "drift": drift_map.get(name)})
+    return records, n_issues, {"repos": len(cfg.get("repos", []))}
+
+
+# TODO(adopt): one sweep_<class> + measure_<class>_real + compare_<class>
+# per drift class. Keep each class's sweep isolated (run_sweep guard in
+# main) so a broken probe can't blind the rest.
+
+
+SWEEPS = {
+    # "git": sweep_git,   # uncomment as classes are implemented
+}
+
+
+# ------------------------------------------------------------- main
+
+def main() -> int:
+    rows = load_drift_rows()
+    now = datetime.now(timezone.utc)
+    ts = now.isoformat()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    records: list[dict] = []
+    repos_with: list[str] = []
+    total = 0
+    checked: dict = {}
+
+    try:
+        cfg = yaml.safe_load(REPOS_YAML.read_text()) or {}
+    except Exception as e:
+        cfg = {}
+        records.append({"repo": "config:repos",
+                        "issues": [f"repos_yaml_unreadable:{e}"],
+                        "real": {}, "drift": {}})
+
+    def run_sweep(cls: str, fn, *args):
+        """Isolate each class: a broken sweep records sweep_error
+        instead of aborting the whole verification."""
+        try:
+            return fn(*args)
+        except Exception as e:
+            return ([{"repo": f"{cls}:meta",
+                      "issues": [f"sweep_error:{type(e).__name__}:{e}"],
+                      "real": {}, "drift": None}], 1, {})
+
+    for cls, fn in SWEEPS.items():
+        recs, n, chk = run_sweep(cls, fn, rows, cfg)
+        for r in recs:
+            r["ts"] = ts
+            records.append(r)
+            repos_with.append(r["repo"])
+        total += n
+        checked.update({f"{cls}_{k}": v for k, v in chk.items()})
+
+    for r in freshness_records(rows, now):
+        cls = r["repo"].split(":", 1)[0]
+        total += len(r["issues"])
+        repos_with.append(r["repo"])
+        records.append(r)
+
+    # summary line ALWAYS written — consumers distinguish "clean sweep"
+    # from "sweep never ran" by its presence and recency
+    summary = {"ts": ts, "class": "meta-sweep",
+               "repos_checked": len(cfg.get("repos", [])),
+               "targets_checked": checked,
+               "discrepancies": total,
+               "repos_with_issues": repos_with}
+    records.append(summary)
+
+    for rec in records:
+        jsonl_append(OUT_PATH, rec)
+    print(f"meta-sweep: {total} discrepancies")
+    if repos_with:
+        print("  targets: " + ", ".join(sorted(set(repos_with))))
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

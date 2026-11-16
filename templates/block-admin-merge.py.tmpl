@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""PreToolUse hook — deny a specific dangerous command shape.
+
+WHY this hook exists
+--------------------
+Some rules are cheap to state and expensive to audit after the fact:
+"never merge with --admin" is one flag away in a shell command, and a
+post-session compliance audit finds it only after the irreversible act.
+A PreToolUse hook closes the loop at execution time: the harness sends
+the pending tool call as JSON on stdin; this script answers ALLOW or
+DENY before the command runs.
+
+Contract (Claude-Code-style hooks; adapt field names to your harness)::
+
+    stdin : {"tool_name": "exec", "tool_input": {"command": "..."},
+             "cwd": "..."}
+    stdout: {"permissionDecision": "allow"}            -> proceed
+            {"permissionDecision": "deny",
+             "permissionDecisionReason": "why + alternative"}
+    Some harnesses instead use exit codes: 0 = allow, 2 = deny with the
+    reason on stderr. This template emits BOTH signals (JSON on stdout,
+    exit 2 on deny) so it works under either contract — TODO(adopt):
+    check which one your dispatcher honours and drop the other.
+
+The hard part is NOT the deny — it's not false-positiving on prose.
+The hook sees the raw command STRING, including commit messages,
+`echo` arguments and quoted text. Matching `gh pr merge --admin`
+anywhere would block `git commit -m "revert gh pr merge --admin"`.
+
+The fix is COMMAND-POSITION matching: a dangerous binary only counts
+when it appears where a command can start — beginning of the string or
+after a command separator (``;``, ``|``, ``&&``, ``||``, newline,
+backtick, ``(``). Quotes and spaces are NOT boundaries: inside quotes is
+prose. Wrappers (``sh -c '...'``, ``sudo``, ``env FOO=bar``) are handled
+by either unwrapping one level or by patterns that reach inside the
+quoted payload.
+
+Fail-safe: unreadable/missing payload => ALLOW. A guard that crashes
+must never wedge the session; the post-hoc compliance audit remains the
+backstop for what slips through.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+# ------------------------------------------------------------------
+# TODO(adopt): define WHAT this hook blocks. The example below blocks
+# `gh pr merge --admin` because bypassing required reviews is the
+# canonical "looks fine, breaks governance" command. Swap the patterns
+# for your own forbidden shapes; keep the boundary discipline.
+# ------------------------------------------------------------------
+
+# Command-start boundary: start of string/line, or after a separator.
+# Deliberately EXCLUDES quotes and whitespace — text inside quotes is
+# data (commit messages, echo args), not execution.
+_BOUNDARY = r"(?:^|[;&|`\n(])"
+
+# Optional privilege/env prefixes that may precede the real command.
+_PREFIX = r"(?:(?:sudo|env|nice|time|command|builtin|exec|nohup|xargs)"
+_PREFIX += r"\s+(?:-\S+\s+)*)*(?:[A-Za-z_]\w*=\S+\s+)*"
+
+_BLOCKED_PATTERNS = [
+    # gh pr merge <anything> --admin   (flag anywhere in the merge args;
+    # [^\n;|&]* stops at the next command so a later --admin doesn't leak)
+    re.compile(
+        _BOUNDARY + r"\s*" + _PREFIX + r"gh\s+pr\s+merge\b"
+        r"[^\n;|&]*--admin\b",
+        re.IGNORECASE | re.MULTILINE),
+    # gh api ... /merge(s) ... --admin   (same bypass via REST endpoint)
+    re.compile(
+        _BOUNDARY + r"\s*" + _PREFIX + r"gh\s+api\b[^\n;|&]*/merges?\b"
+        r"[^\n;|&]*--admin\b",
+        re.IGNORECASE | re.MULTILINE),
+    # wrapper: sh|bash|zsh -c 'gh pr merge ... --admin'
+    # (the gh lives inside quotes — covered here without FPs on prose;
+    # _PREFIX already permits zero prefixes, so plain `sh -c` matches)
+    re.compile(
+        _BOUNDARY + r"\s*" + _PREFIX +
+        r"(?:sh|bash|zsh)\s+-c\s+[\"'][^\"']*"
+        r"\bgh\s+pr\s+merge\b[^\"']*--admin\b",
+        re.IGNORECASE | re.MULTILINE),
+]
+
+_DENY_REASON = (
+    "BLOCKED: 'gh pr merge --admin' bypasses required review and is "
+    "prohibited by policy. Alternatives: let the normal merge gate run "
+    "(checks + approvals), or use the documented bootstrap/override "
+    "procedure for the repo owner."
+)
+
+
+def _extract_command(payload: dict) -> str:
+    """Pull the shell command out of the hook payload.
+
+    Harnesses differ: Devin/Claude shapes nest it under
+    ``tool_input.command``; others put ``command``/``cmd``/``input`` at
+    top level. Try the known shapes, return "" when absent — an empty
+    command means nothing to check (ALLOW)."""
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    if isinstance(tool_input, dict):
+        cmd = tool_input.get("command")
+        if isinstance(cmd, str):
+            return cmd
+    for key in ("command", "cmd", "input", "shell", "script"):
+        val = payload.get(key)
+        if isinstance(val, str):
+            return val
+    return ""
+
+
+def _emit(decision: str, reason: str = "") -> None:
+    """Emit the harness decision. JSON contract first; exit code second."""
+    out = {"permissionDecision": decision}
+    if reason:
+        out["permissionDecisionReason"] = reason
+    print(json.dumps(out))
+    if decision == "deny":
+        print(reason, file=sys.stderr)
+        sys.exit(2)   # exit-code contract: non-zero = deny
+
+
+def main() -> int:
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip().startswith("{") else {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    command = _extract_command(payload)
+    if not command:
+        _emit("allow")
+        return 0
+
+    for pat in _BLOCKED_PATTERNS:
+        if pat.search(command):
+            _emit("deny", _DENY_REASON)
+            return 2
+    _emit("allow")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

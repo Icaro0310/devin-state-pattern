@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""drift-deps — dependency-bot PR hygiene (Dependabot/Renovate/...).
+
+WHY this check exists
+---------------------
+Bot PRs are the classic "green dashboard, red reality" drift: they pile
+up quietly (each one small), start conflicting with each other, and go
+stale because nobody rebases them. The failure mode is not one big
+incident — it is 15 open PRs nobody can merge, discovered during an
+incident when you actually need a dependency update.
+
+This check lists open PRs authored by the configured bot login(s) per
+repo and flags:
+
+- ``open=N``               — more open bot PRs than ``max_open_prs_per_repo``
+- ``conflicts=[...]``      — PRs the forge reports as CONFLICTING
+- ``stale=[...]``          — PRs older than ``max_age_hours_without_rebase``
+
+Declaration shape (``dependabot.yaml`` — rename to ``deps.yaml`` if you
+prefer)::
+
+    dependabot:
+      bot_authors: ["app/dependabot", "dependabot[bot]"]   # TODO(adopt)
+      repos: ["owner/repo-a", "owner/repo-b"]              # TODO(adopt)
+      rules:
+        max_open_prs_per_repo: 4
+        max_age_hours_without_rebase: 72
+        alert_on_conflict: true
+      # Debt acknowledged with an expiry: while `expires` is in the
+      # future the repo's violations are suppressed; the day after, they
+      # resurface automatically. No expires = permanent waiver (rare).
+      known_debt:
+        - { repo: "owner/repo-a", reason: "waiting on upstream release",
+            expires: "2026-12-01" }                        # TODO(adopt)
+
+The bot login strings are forge-specific — check what your forge
+actually reports (``gh pr list --json author`` shows the login; bot
+apps appear as ``app/<name>``). TODO(adopt): adjust ``--author`` flags
+below to match your bot(s).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.alert import active_debts
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+YAML_PATH = Path(os.environ.get("DEPENDABOT_YAML",
+                               ECOSYSTEM_ROOT / "dependabot.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+
+
+def gh_json(args: list[str], timeout: int = 60) -> list | dict | None:
+    """``gh ... --json`` parsed; None on any failure (fail-open)."""
+    rc, out, _e = cmd_run(["gh", *args], timeout=timeout)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out or "[]")
+    except Exception:
+        return None
+
+
+def bot_prs(repo: str, authors: list[str]) -> list[dict]:
+    """Open PRs by any of ``authors`` in ``repo`` (one call per author —
+    ``gh pr list --author`` accepts a single login)."""
+    out: list[dict] = []
+    seen: set[int] = set()
+    for author in authors:
+        prs = gh_json(["pr", "list", "-R", repo, "--author", author,
+                       "--state", "open", "--limit", "100",
+                       "--json", "number,title,createdAt,mergeable,"
+                                 "updatedAt,author"])
+        if not isinstance(prs, list):
+            continue
+        for p in prs:
+            n = p.get("number")
+            if n is not None and n not in seen:
+                seen.add(n)
+                out.append(p)
+    return out
+
+
+def check_repo(repo: str, cfg: dict, now: datetime) -> dict:
+    """Measure one repo's bot-PR state; ALWAYS returns a record."""
+    authors = cfg.get("bot_authors") or ["app/dependabot"]
+    rules = cfg.get("rules", {})
+    prs = bot_prs(repo, authors)
+    n = len(prs)
+    conflicts = [p["number"] for p in prs
+                 if p.get("mergeable") == "CONFLICTING"]
+    old: list[int] = []
+    max_age_h = float(rules.get("max_age_hours_without_rebase", 72))
+    for p in prs:
+        try:
+            created = datetime.fromisoformat(
+                str(p["createdAt"]).replace("Z", "+00:00"))
+            if (now - created).total_seconds() / 3600 > max_age_h:
+                old.append(p["number"])
+        except Exception:
+            continue
+    v: list[str] = []
+    if n > int(rules.get("max_open_prs_per_repo", 4)):
+        v.append(f"open={n}")
+    if conflicts and rules.get("alert_on_conflict", True):
+        v.append(f"conflicts={conflicts}")
+    if old:
+        v.append(f"stale={old}")
+    # known_debt suppresses the repo's violations while unexpired —
+    # the reason is carried into the record for the report.
+    repo_debt = active_debts(cfg.get("known_debt") or [], now,
+                             match={"repo": repo})
+    reasons = "; ".join(str(d.get("reason", "")) for d in repo_debt)
+    suppressed = bool(repo_debt)
+    return {"class": "deps", "repo": repo, "open": n,
+            "conflicts": conflicts, "stale": old,
+            "known_debt": reasons,
+            "violations": [] if suppressed else v,
+            "count": 0 if suppressed else len(v)}
+
+
+def main() -> int:
+    with open(YAML_PATH) as f:
+        cfg = yaml.safe_load(f)
+    section = (cfg or {}).get("dependabot") or (cfg or {}).get("deps") or {}
+    ts = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    results = [check_repo(repo, section, now)
+               for repo in section.get("repos", [])]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        r["ts"] = ts
+        jsonl_append(OUT_PATH, r)
+    print(f"drift-deps: {sum(r['count'] for r in results)} violations")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

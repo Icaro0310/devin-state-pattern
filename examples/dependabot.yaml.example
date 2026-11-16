@@ -1,0 +1,28 @@
+# dependabot.yaml — classification and policy for automated dependency PRs.
+#
+# Separate from prs.yaml on purpose: bot PRs have different rules (auto
+# rebase, caps on open count, conflict alerts) and must not fire the
+# human-PR alerts. Keep the repo lists in sync with prs.yaml.
+
+dependabot:
+  repos:
+    - example-org/webapp
+    - example-org/api
+    - example-org/worker
+
+  rules:
+    max_open_prs_per_repo: 4           # alert when more bot PRs than this are open
+    max_age_hours_without_rebase: 72   # alert if a bot PR goes stale vs base
+    alert_on_conflict: true            # alert when a bot PR has merge conflicts
+    auto_rebase: true                  # reconciler may comment '@dependabot rebase'
+
+  # known_debt: same expiry semantics as prs.yaml — use it for windows like
+  # "rebase requested, waiting on the bot" so you don't alert twice. After
+  # 'expires' the violation resurfaces by itself.
+  known_debt:
+    - repo: example-org/webapp
+      reason: "rebase commands sent; waiting for dependabot to refresh"
+      expires: "2026-12-05"
+    - repo: example-org/worker
+      reason: "major-version bump held for manual review"
+      expires: "2026-12-10"

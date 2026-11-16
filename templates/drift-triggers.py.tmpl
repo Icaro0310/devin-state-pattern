@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""drift-triggers — SKELETON: declared triggers vs observed firings.
+
+WHY this check exists
+---------------------
+A manifest that says "tool X runs every 20 min" is a claim, not a fact.
+Triggers rot in a specific way: the cron line survives but the script it
+calls was deleted; the systemd timer exists but the unit is masked; the
+hook is wired but the handler exits early. The tool *looks* configured
+and simply never fires — SILENT drift, invisible until the report that
+was supposed to arrive doesn't.
+
+This checker closes the loop: for every declared trigger it asks two
+independent questions —
+
+1. **active?**   is the trigger wired in the OS/agent config at all?
+2. **fired?**    when did it last produce observable evidence?
+
+and classifies the answer. It also looks the other way: triggers that
+exist in reality but were never declared (PHANTOM), and declared tools
+whose domains overlap (COMPETING — usually an accident of history where
+two mechanisms do the same job).
+
+Classification taxonomy (tool-level status = worst of its triggers):
+
+- ``OK``            — active AND fired within ~2x the expected interval.
+- ``SILENT``        — active but hasn't fired within the window (or ever).
+                      The dangerous one: configured, dead.
+- ``MISSING``       — declared but the trigger is not active in the OS.
+- ``MIGRATED``      — local trigger intentionally removed; the job moved
+                      to a native platform feature (documented move).
+- ``DISABLED``      — tool deliberately off (owner decision, with reason).
+- ``DRYRUN``        — fires on schedule but produces no real effect by
+                      design (calibration/report-only mode).
+- ``NO_EFFECT``     — fires, evidence exists, but the declared effect is
+                      absent (TODO: needs effect-level evidence, harder).
+- ``PHANTOM``       — a real trigger found in the OS that the manifest
+                      never declared (undeclared automation = un-audited).
+- ``COMPETING``     — 2+ tools claim the same domain with overlapping
+                      schedules; pick one, document the loser.
+- ``UNVERIFIABLE``  — manual/on-demand/always-on triggers, or evidence
+                      sources this checker can't read. Honest, not green.
+
+Manifest shape (``triggers.yaml``)::
+
+    tools:
+      - name: nightly-report
+        type: cron-job                # cosmetic grouping only
+        domain: reporting             # COMPETING detection key
+        status: enabled               # or "disabled" -> DISABLED class
+        triggers:
+          - kind: cron                # TODO(adopt): see KINDS below
+            ref: nightly-report       # what to look for in `crontab -l`
+            expected: daily           # frequency vocabulary below
+            evidence: { source: log, key: "~/logs/nightly.log" }
+        notes: "what it does and why it exists"
+
+This file is a SKELETON: the classification state machine below is real
+and generic; the evidence loaders and per-kind probes are TODO stubs you
+must adapt to YOUR manifest's ``kind`` vocabulary and evidence sources.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+MANIFEST = Path(os.environ.get("TRIGGERS_MANIFEST",
+                              ECOSYSTEM_ROOT / "triggers.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+NOW = time.time()
+
+# Frequency vocabulary -> seconds. "a|b" means "the shorter wins" (the
+# most sensitive window). Non-temporal frequencies map to None.
+EXPECTED_S = {
+    "3min": 180, "5min": 300, "15min": 900, "20min": 1200, "30min": 1800,
+    "40min": 2400, "hourly": 3600, "2hourly": 7200, "3hourly": 10800,
+    "daily": 86400, "weekly": 604800, "monthly": 2592000,
+    "every-session": None, "always-on": None, "manual": None,
+    "on-demand": None, "unknown": None, "on-change": None,
+}
+UNVERIFIABLE_FREQ = {"every-session", "always-on", "manual", "on-demand",
+                     "unknown", "on-change"}
+
+# Worst-first severity for rolling trigger statuses up to a tool status.
+SEV_ORDER = {"OK": 0, "MIGRATED": 0, "DISABLED": 0, "UNVERIFIABLE": 1,
+             "DRYRUN": 2, "SILENT": 3, "NO_EFFECT": 4, "MISSING": 5,
+             "PHANTOM": 5, "COMPETING": 5}
+
+
+def sh(cmd: str, timeout: int = 15) -> tuple[str, int]:
+    """Fail-open shell runner: (stdout, rc). Never raises."""
+    rc, out, _e = cmd_run(cmd, timeout=timeout, shell=True)
+    return out, rc
+
+
+def expected_seconds(expected: str) -> float | None:
+    """'40min'->2400, 'daily'->86400, 'every-session'->None.
+    'daily|weekly' -> min (shortest frequency = most sensitive window)."""
+    e = str(expected or "unknown").strip().lower()
+    parts = [p.strip() for p in e.split("|") if p.strip()] or [e]
+    vals = []
+    for p in parts:
+        if p in EXPECTED_S:
+            v = EXPECTED_S[p]
+        else:
+            m = re.fullmatch(r"(\d+)\s*(min|h|d|s)", p)
+            v = (int(m.group(1)) * {"s": 1, "min": 60,
+                                    "h": 3600, "d": 86400}[m.group(2)]
+                 if m else None)
+        if v is not None:
+            vals.append(v)
+    return min(vals) if vals else None
+
+
+# ---------------------------------------------------------- evidence
+# TODO(adopt): implement loaders for YOUR evidence sources. The contract
+# is simple: each returns enough to answer "when did this last fire?"
+# (epoch float or None) and caches per run.
+
+_cache: dict[str, object] = {}
+
+
+def crontab_lines() -> list[str]:
+    if "cron" not in _cache:
+        out, _rc = sh("crontab -l 2>/dev/null")
+        _cache["cron"] = out.splitlines()
+    return _cache["cron"]  # type: ignore[return-value]
+
+
+def timers() -> str:
+    if "timers" not in _cache:
+        out, _rc = sh("systemctl --user list-timers --all --no-pager "
+                      "2>/dev/null")
+        _cache["timers"] = out
+    return _cache["timers"]  # type: ignore[return-value]
+
+
+def file_mtime(path: str) -> float | None:
+    """mtime epoch of a file, or max-mtime inside a dir (bounded walk)."""
+    p = os.path.expanduser(path)
+    try:
+        if os.path.isfile(p):
+            return os.path.getmtime(p)
+        if os.path.isdir(p):
+            best = os.path.getmtime(p)
+            n = 0
+            for root, _dirs, files in os.walk(p):
+                for fn in files:
+                    try:
+                        m = os.path.getmtime(os.path.join(root, fn))
+                        if m > best:
+                            best = m
+                    except OSError:
+                        pass
+                    n += 1
+                    if n > 3000:
+                        return best
+            return best
+        return None
+    except OSError:
+        return None
+
+
+def parse_ts(v) -> float | None:
+    """epoch from ISO string or numeric timestamp."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return datetime.fromisoformat(
+            str(v).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+# TODO(adopt): add loaders for your evidence sources, e.g.:
+#   - append-only event ledgers (heartbeats.jsonl, executions.jsonl)
+#   - journalctl --user -u <unit> last-entry timestamps
+#   - hook-fires / dispatcher logs
+# Each should cache results in _cache so N triggers don't re-read.
+
+
+# ------------------------------------------------------- per-kind probes
+# active_check answers "is the trigger wired?" -> True | False | None
+# (None = cannot determine; treated as unverifiable, not missing).
+
+def cron_check(ref: str) -> tuple[bool | None, str]:
+    """ref is matched as substring against ACTIVE (non-commented) lines
+    of `crontab -l`. A commented-out '# MIGRATED ...' block counts as
+    migrated, not missing — document intentional removals in the comment
+    so the checker doesn't flag them."""
+    raw = crontab_lines()
+    migrated = False
+    for line in raw:
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            if "MIGRATED" in s.upper():
+                migrated = True
+            continue
+        if ref and ref in s:
+            return True, f"crontab:{ref}"
+    if migrated:
+        return False, f"migrated:{ref}"
+    return False, f"crontab:{ref}"
+
+
+def systemd_timer_check(ref: str) -> tuple[bool | None, str]:
+    return (ref in timers(), f"timer:{ref}")
+
+
+def systemd_service_check(ref: str) -> tuple[bool | None, str]:
+    _out, rc = sh(f"systemctl --user is-active {ref} 2>/dev/null")
+    return (rc == 0, f"service:{ref}")
+
+
+def process_check(ref: str) -> tuple[bool | None, str]:
+    """ref = regex for `pgrep -f`. The '--' keeps refs starting with '-'
+    from being parsed as pgrep options."""
+    _out, rc = sh(f"pgrep -f -- '{ref}' >/dev/null 2>&1", timeout=10)
+    return (rc == 0, f"pgrep:{ref[:50]}")
+
+
+def active_check(tr: dict) -> tuple[bool | None, str]:
+    """Dispatch on trigger kind. TODO(adopt): register YOUR kinds —
+    webhook, queue-consumer, IDE-extension, CI-workflow, etc."""
+    kind, ref = tr.get("kind"), str(tr.get("ref") or "")
+    if kind == "cron":
+        return cron_check(ref)
+    if kind == "systemd-timer":
+        return systemd_timer_check(ref)
+    if kind == "systemd-service":
+        return systemd_service_check(ref)
+    if kind == "process":
+        return process_check(ref)
+    # TODO(adopt): kinds that can't be probed locally (SaaS schedules,
+    # external CI) should return (None, "unverifiable:<kind>") — honest
+    # UNVERIFIABLE beats a fake MISSING.
+    return (None, f"unknown-kind:{kind}")
+
+
+def last_run_check(tr: dict) -> tuple[float | None, str]:
+    """When did this trigger last fire? -> (epoch|None, detail).
+
+    Dispatch on evidence.source. TODO(adopt): implement the sources your
+    manifest uses; the examples below cover the common ones."""
+    ev = tr.get("evidence") or {}
+    src, key = ev.get("source"), str(ev.get("key") or "")
+    if src == "file-mtime":
+        # key may be 'a|b' alternatives — first hit wins
+        for k in key.split("|"):
+            m = file_mtime(k.strip())
+            if m:
+                return m, f"mtime:{k}"
+        return None, f"mtime:{key} missing"
+    if src in ("manual", "none"):
+        return None, f"{src}:{key}"
+    # TODO(adopt):
+    #   source: heartbeat  -> your run-events ledger, key = tool name
+    #   source: journalctl -> journal_last(key) for systemd units
+    #   source: executions -> dispatcher/hook-fires ledger
+    #   source: log        -> mtime of a log the job appends to
+    return (None, f"evidence-unknown:{src}")
+
+
+def classify(tr: dict, tool: dict) -> tuple[str, str, float | None]:
+    """(status, detail, last_ts) for ONE trigger declaration.
+
+    Decision tree — the heart of the check:
+
+    active=False + 'migrated' in detail -> MIGRATED (intentional move)
+    active=False                    -> MISSING  (declared, not wired)
+    non-temporal expected           -> OK if active else UNVERIFIABLE
+    temporal expected, never fired  -> DRYRUN if effect_mode is
+                                       dry-run/report-only else SILENT
+    fired within 2x interval        -> OK (or DRYRUN if effect_mode says so)
+    fired but stale                 -> SILENT (or DRYRUN likewise)
+    """
+    expected = str(tr.get("expected") or "unknown")
+    emode = tr.get("effect_mode") or "real"
+    active, adetail = active_check(tr)
+    last_ts, ldetail = last_run_check(tr)
+
+    if active is False:
+        if "migrated" in adetail:
+            return "MIGRATED", f"trigger migrado p/ nativo ({adetail})", last_ts
+        return "MISSING", f"trigger inactivo ({adetail})", last_ts
+
+    freq_s = expected_seconds(expected)
+    if freq_s is None:
+        if expected in ("always-on", "every-session"):
+            if active is True:
+                return "OK", f"active ({adetail})", last_ts
+            if active is False:
+                return "MISSING", f"deveria estar activo ({adetail})", last_ts
+            return "UNVERIFIABLE", f"always-on não confirmável ({adetail})", last_ts
+        # manual / on-demand / unknown / on-change
+        if active is True:
+            return "UNVERIFIABLE", (f"trigger activo mas recência não "
+                                    f"auditável ({adetail})"), last_ts
+        return "OK", f"manual/declared ({adetail})", last_ts
+
+    # temporal expected: needs last_run evidence
+    if last_ts is None:
+        if emode in ("dry-run", "report-only"):
+            return "DRYRUN", f"nunca corrido (dry-run) [{ldetail}]", None
+        return "SILENT", f"nunca executou [{ldetail}] (esperado {expected})", None
+    age = NOW - last_ts
+    window = freq_s * 2  # 2x grace: timers drift, cron has jitter
+    if age <= window:
+        if emode in ("dry-run", "report-only"):
+            return "DRYRUN", f"corre mas efeito nulo por design ({ldetail})", last_ts
+        return "OK", f"última há {age/3600:.1f}h ({ldetail})", last_ts
+    if emode in ("dry-run", "report-only"):
+        return "DRYRUN", f"última há {age/86400:.1f}d — dry-run ({ldetail})", last_ts
+    return "SILENT", (f"última há {age/86400:.1f}d > {window/86400:.1f}d "
+                      f"({ldetail})"), last_ts
+
+
+def worst(statuses: list[str]) -> str:
+    return max(statuses, key=lambda s: SEV_ORDER.get(s, 0)) if statuses else "UNVERIFIABLE"
+
+
+# ------------------------------------------------------- phantom/competing
+# TODO(adopt): implement for YOUR platform. The pattern:
+#   - enumerate REAL triggers from the OS (crontab lines, systemd units,
+#     running processes, hook configs, MCP server lists)
+#   - subtract the manifest's declared refs -> PHANTOM candidates
+#   - group declared tools by `domain`; >1 tool sharing a domain with
+#     temporal expected frequencies -> COMPETING (allow opt-out via a
+#     documented `skip_competition: true` + `competition_note`)
+
+def collect_phantoms(declared_refs: dict) -> list[tuple[str, str]]:
+    """Real triggers not declared in the manifest -> [(kind, name)]."""
+    phantoms: list[tuple[str, str]] = []
+    # TODO(adopt): e.g. scan crontab_lines() for `hb run <name>` /
+    # script paths not present in declared_refs["cron"]/["script"], and
+    # `systemctl --user list-timers` for undeclared *.timer units.
+    return phantoms
+
+
+def collect_competing(tools: list[dict]) -> tuple[list, dict]:
+    """Domains claimed by >1 tool -> (pairs, skipped_with_reason)."""
+    by_domain: dict[str, list] = {}
+    skipped = {}
+    for t in tools:
+        dom = t.get("domain")
+        if not dom:
+            continue
+        if t.get("skip_competition"):
+            skipped[t["name"]] = t.get("competition_note", "")
+            continue
+        for tr in t.get("triggers", []):
+            exp = str(tr.get("expected") or "")
+            if exp in UNVERIFIABLE_FREQ or exp == "always-on":
+                continue
+            by_domain.setdefault(dom, []).append((t["name"], exp))
+    pairs = []
+    for dom, members in by_domain.items():
+        names = sorted({n for n, _ in members})
+        if len(names) > 1:
+            exps = {e for _, e in members}
+            pairs.append((dom, names, sorted(exps)))
+    return pairs, skipped
+
+
+# ------------------------------------------------------------- main
+
+def run(manifest_path: Path = MANIFEST) -> int:
+    try:
+        doc = yaml.safe_load(Path(manifest_path).read_text())
+    except Exception as e:
+        print(f"drift-triggers: FATAL manifest ilegível: {e}",
+              file=sys.stderr)
+        return 2
+    tools = (doc or {}).get("tools") or []
+    lines: list[dict] = []
+    summary = {s: 0 for s in
+               ("OK", "SILENT", "NO_EFFECT", "MISSING", "DRYRUN",
+                "UNVERIFIABLE", "PHANTOM", "COMPETING", "MIGRATED",
+                "DISABLED")}
+
+    # declared refs per kind — needed by phantom detection
+    declared: dict[str, set] = {}
+    # TODO(adopt): fill declared[kind] with the ref strings your
+    # collect_phantoms compares against.
+
+    for tool in tools:
+        name = tool.get("name", "?")
+        trs = tool.get("triggers") or []
+        if tool.get("status") == "disabled":
+            lines.append({"class": "triggers", "check": name, "tool": name,
+                          "ok": True, "status": "DISABLED",
+                          "detail": "desactivado de propósito "
+                                    f"({tool.get('notes') or 'sem motivo'})",
+                          "violations": [], "count": 0})
+            summary["DISABLED"] += 1
+            continue
+        if not trs:
+            lines.append({"class": "triggers", "check": name, "tool": name,
+                          "ok": True, "status": "UNVERIFIABLE",
+                          "detail": "sem triggers declarados",
+                          "violations": [], "count": 0})
+            summary["UNVERIFIABLE"] += 1
+            continue
+        statuses, details = [], []
+        for tr in trs:
+            st, det, _lts = classify(tr, tool)
+            statuses.append(st)
+            details.append(f"{tr.get('kind')}:{tr.get('ref')}={st}")
+        bad = [s for s in statuses
+               if s not in ("OK", "DRYRUN", "MIGRATED", "DISABLED")]
+        ok = worst(statuses) in ("OK", "DRYRUN", "UNVERIFIABLE",
+                                 "MIGRATED", "DISABLED")
+        wst = worst(statuses)
+        lines.append({"class": "triggers", "check": name, "tool": name,
+                      "ok": ok, "status": wst,
+                      "detail": "; ".join(details)[:600],
+                      "violations": bad, "count": len(bad)})
+        summary[wst] = summary.get(wst, 0) + 1
+
+    for kind, name in collect_phantoms(declared):
+        lines.append({"class": "triggers", "check": f"phantom:{name}",
+                      "tool": name, "ok": False, "status": "PHANTOM",
+                      "detail": f"trigger real ({kind}) não declarado",
+                      "violations": ["PHANTOM"], "count": 1})
+        summary["PHANTOM"] += 1
+
+    comp_pairs, comp_skipped = collect_competing(tools)
+    for dom, names, exps in comp_pairs:
+        lines.append({"class": "triggers", "check": f"competing:{dom}",
+                      "tool": ",".join(names), "ok": False,
+                      "status": "COMPETING",
+                      "detail": f"domain={dom} tools={names} expected={exps}",
+                      "violations": ["COMPETING"], "count": 1})
+        summary["COMPETING"] += 1
+
+    ts = datetime.now(timezone.utc).isoformat()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for ln in lines:
+        ln["ts"] = ts
+        jsonl_append(OUT_PATH, ln)
+
+    nviol = sum(1 for ln in lines if ln["count"] > 0)
+    print(f"drift-triggers: {len(tools)} tools, {nviol} com issues "
+          f"(SILENT={summary['SILENT']} MISSING={summary['MISSING']} "
+          f"PHANTOM={summary['PHANTOM']} COMPETING={summary['COMPETING']})")
+    return 0 if nviol == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(run())

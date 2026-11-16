@@ -1,0 +1,47 @@
+# fleet.yaml — declare the toolchain "fleet": pinned package versions,
+# virtualenvs and the agent runtime state that must stay consistent.
+#
+# Typical consumers:
+#   * spec drift   — an installed package != pinned_version, or a venv/tool
+#                    missing the pinned spec_requirement.
+#   * harness drift — runtime state (config, ledgers, backups) stale,
+#                    missing, or backed up too long ago.
+#
+# Adjust every path to your layout. ~ expands to the service account home.
+
+fleet:
+  spec:
+    canonical_repo: ~/code/example-org/toolkit      # repo that owns the spec
+    pypi_package: example-toolkit                     # published package name
+    pinned_version: "1.4.2"                           # version everything must match
+    state_db: ~/.local/share/example-agent/state.db  # runtime DB whose schema must match the pin
+    backup_dir: ~/backups                             # where state backups live
+    max_allowed_schema_gap: 0                         # 0 = refuse ANY schema drift
+
+  # Project virtualenvs that must have the pinned package installed.
+  # The checker compares `pip show <pkg>` inside each .venv against spec.
+  dev_venvs:
+    - path: ~/code/example-org/webapp/.venv
+    - path: ~/code/example-org/api/.venv
+    - path: ~/code/example-org/worker/.venv
+
+  # CLI tools installed from the pinned spec (e.g.
+  # `uv tool install "example-toolkit[ops]==1.4.2"`). spec_requirement is
+  # the exact requirement string the installer must satisfy — the drift
+  # check re-resolves it and compares with what is actually installed.
+  uv_tools:
+    - name: eco-doctor
+      spec_requirement: "example-toolkit[ops]==1.4.2"
+    - name: eco-reporter
+      spec_requirement: "example-toolkit==1.4.2"
+
+  # Agent harness / runtime state — deliberately outside version control.
+  # A backup job must keep it fresh; drift checks alert when the newest
+  # backup is older than max_backup_age_hours or a declared path vanishes.
+  harness:
+    backup_dir: ~/backups/harness
+    max_backup_age_hours: 26          # alert if newest backup is older than this
+    ledger_dir: ~/.local/state/example-agent/ledger
+    agent_config: ~/.config/example-agent/config.json
+    compat_shim: ~/.local/share/example-agent/skills/legacy-hook
+    shim_expires: "2026-12-31"        # optional: date a compat shim is removed

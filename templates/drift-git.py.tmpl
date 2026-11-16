@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""drift-git — measure git repo hygiene against declared rules.
+
+WHY this check exists
+---------------------
+The most common source of "invisible" drift in a multi-repo ecosystem is
+git state that nobody looks at until it hurts: worktrees that outlived
+their task, stashes that became permanent, commits that were never
+pushed, branches whose PR already merged but whose ref still exists.
+Each is small; together they make `git status` meaningless and make
+"clean checkout" claims unverifiable.
+
+This script is one *class* of a larger drift-reconcile suite: it appends
+one JSON record per repo per run to an append-only ledger
+(``drift.jsonl`` by convention). Downstream tools (drift-alert,
+meta-sweep) read that ledger — so the record shape below is a contract,
+don't rename fields without updating them.
+
+Measure-vs-declare contract (repos.yaml):
+
+    repos:
+      - name: my-repo                    # label used in records/alerts
+        path: /abs/path/to/checkout      # TODO(adopt): real path
+        remote: owner/repo               # optional; enables gh PR checks
+        default_branch: main             # TODO(adopt): your trunk name
+        rules:
+          max_worktrees: 3
+          max_stashes: 1
+          max_unpushed: 0
+          max_behind: 0
+          forbid_detached: true
+          merged_branch_check: true       # gh PR state -> branch refs
+          local_merged_branch_check: true # `git branch --merged` ancestry
+
+Non-obvious decisions worth keeping (each cost a real incident):
+
+- **Fetch BEFORE measuring `behind`.** ``behind`` compares HEAD against
+  ``@{u}`` which resolves through ``refs/remotes/origin/*`` — those refs
+  only move when *someone* fetches. Without an explicit fetch you measure
+  against whatever the last fetch (possibly days ago, possibly by another
+  process) left behind, and the drift under-reports indefinitely. Fetch
+  failure is fail-open: measure with the stale local refs rather than
+  skip the repo — a network blip must not blind the check.
+- **`unpushed` AND `behind` are both drift.** A repo can be clean on one
+  axis and rotten on the other; they are measured independently via
+  ``git log @{u}..HEAD`` / ``HEAD..@{u}``.
+- **Merged/closed PR branches must be deleted.** A merged branch left
+  behind is noise that hides the next real branch; detected two ways —
+  via the forge's PR state (``gh pr list --state all``) and via local
+  ancestry (``git branch --merged <default>``) so squash-merges and
+  no-PR branches are still caught.
+- **``forbid_detached: true``** flags detached HEAD. Some repos
+  legitimately live detached (read-only mirrors); declare
+  ``forbid_detached: false`` for those instead of weakening the check.
+- **Branches checked out in a worktree are never actionable.** `git
+  branch -d` refuses them, so flagging them is alert noise — they are
+  excluded from merged-branch violations.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+# TODO(adopt): point ECOSYSTEM_ROOT at the directory that contains your
+# declared-state YAMLs (repos.yaml etc.). Env override keeps tests and
+# one-off runs honest.
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),  # state/bin -> state/
+))
+YAML_PATH = Path(os.environ.get("REPOS_YAML", ECOSYSTEM_ROOT / "repos.yaml"))
+
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+
+# Branch names that are never "dead branches" — the trunk and pseudo-refs.
+PROTECTED = {"main", "master", "develop", "HEAD"}
+
+
+def git(path: str, *args: str, timeout: float = 30) -> str:
+    """stdout of ``git -C <path> <args>``, stripped; '' on any failure."""
+    rc, out, _err = cmd_run(["git", "-C", str(path), *args], timeout=timeout)
+    return out.strip() if rc == 0 else ""
+
+
+def pr_states(remote_slug: str, path: str) -> dict[str, str] | None:
+    """branch -> 'MERGED'|'CLOSED'|'OPEN' for branches with a PR.
+
+    One ``gh pr list`` call per repo (never one per branch). Returns None
+    when the forge CLI is unavailable or the repo has no remote — the
+    caller treats None as 'skip PR-state checks', not as 'no PRs'.
+    OPEN wins over terminal states when a headRefName has several PRs.
+    """
+    if not remote_slug:
+        return None
+    rank = {"CLOSED": 1, "MERGED": 2, "OPEN": 3}
+    rc, out, _err = cmd_run(
+        ["gh", "pr", "list", "-R", remote_slug, "--state", "all",
+         "--limit", "500", "--json", "number,state,headRefName"],
+        timeout=60)
+    if rc != 0:
+        return None
+    try:
+        prs = json.loads(out or "[]")
+    except Exception:
+        return None
+    states: dict[str, str] = {}
+    for pr in prs:
+        head, st = pr.get("headRefName"), pr.get("state")
+        if not head or st not in rank:
+            continue
+        if rank[st] > rank.get(states.get(head), 0):
+            states[head] = st
+    return states
+
+
+def worktree_checked_out_branches(path: str) -> set[str]:
+    """Branches checked out in ANY worktree — they cannot be deleted,
+    so they are never actionable drift."""
+    out = git(path, "worktree", "list", "--porcelain")
+    return {ln.split("refs/heads/", 1)[1].strip()
+            for ln in out.splitlines()
+            if ln.startswith("branch refs/heads/")}
+
+
+def merged_branch_violations(path: str, remote_slug: str,
+                             default_branch: str,
+                             states: dict[str, str] | None) -> tuple[list[str], str]:
+    """Local+remote branches whose PR is MERGED/CLOSED but ref exists."""
+    if states is None:
+        return [], "skipped"
+    v: list[str] = []
+    locals_ = [b for b in git(path, "branch",
+                             "--format=%(refname:short)").splitlines()
+               if b.strip()]
+    remotes = git(path, "ls-remote", "--heads", "origin", timeout=60)
+    remote_names = []
+    for line in remotes.splitlines():
+        ref = line.split("refs/heads/", 1)
+        if len(ref) == 2:
+            remote_names.append(ref[1].strip())
+    seen: set[str] = set()
+    for b in locals_ + remote_names:
+        b = b.strip()
+        if not b or b in PROTECTED or b == default_branch or b in seen:
+            continue
+        seen.add(b)
+        st = states.get(b)
+        if st == "MERGED":
+            v.append(f"merged-branch-not-deleted:{b}")
+        elif st == "CLOSED":
+            v.append(f"closed-branch-not-deleted:{b}")
+    return v, "ok"
+
+
+def local_merged_branch_violations(path: str, default_branch: str,
+                                   current_branch: str) -> list[str]:
+    """Local branches already merged into the default branch but not
+    deleted — catches ancestry merges even with no PR / no forge CLI.
+
+    Merge base prefers a local ``<default_branch>`` ref and falls back to
+    ``origin/<default_branch>`` (checkouts often only carry the
+    remote-tracking ref). Worktree-pinned branches are skipped.
+    """
+    v: list[str] = []
+    base = None
+    if git(path, "rev-parse", "--verify", "--quiet",
+           f"refs/heads/{default_branch}"):
+        base = default_branch
+    elif git(path, "rev-parse", "--verify", "--quiet",
+             f"refs/remotes/origin/{default_branch}"):
+        base = f"origin/{default_branch}"
+    if not base:
+        return v
+    skip = worktree_checked_out_branches(path)
+    merged = [b.strip() for b in
+              git(path, "branch", "--merged", base,
+                  "--format=%(refname:short)").splitlines() if b.strip()]
+    for b in merged:
+        if (not b or b in PROTECTED or b == default_branch
+                or b == current_branch or b in skip):
+            continue
+        # re-verify the ref exists before flagging (stale --merged output)
+        if not git(path, "branch", "--list", b).strip():
+            continue
+        v.append(f"merged-branch-not-deleted:{b}")
+    return v
+
+
+def check(repo: dict) -> dict:
+    """Measure one repo; ALWAYS returns a record (never raises)."""
+    name, path = repo["name"], repo["path"]
+    rules = repo.get("rules", {})
+    if not os.path.isdir(path):
+        return {"class": "git", "repo": name, "error": "path_missing",
+                "count": 1, "violations": ["path_missing"]}
+    # Fetch FIRST: behind/unpushed measure against refs/remotes/* — without
+    # fetch, origin/* is frozen at whoever fetched last and drift
+    # under-counts indefinitely. Timeout is short on purpose: the caller
+    # (a timer/hook) may kill the whole run; a slow fetch must degrade to
+    # stale-refs measurement, not lose the entire report.
+    fetch_ok = False
+    try:
+        rc, _o, _e = cmd_run(
+            ["git", "-C", str(path), "fetch", "--quiet", "origin"],
+            timeout=10)
+        fetch_ok = rc == 0
+    except Exception:
+        pass
+    try:
+        branch = git(path, "rev-parse", "--abbrev-ref", "HEAD")
+        status = git(path, "status", "--porcelain")
+        dirty = sum(1 for ln in status.splitlines() if ln.strip())
+        stashes = sum(1 for ln in git(path, "stash", "list").splitlines()
+                      if ln.strip())
+        wts = git(path, "worktree", "list", "--porcelain").count("worktree ")
+        # upstream may not exist (new branch, no -u) — then ahead/behind
+        # are both legitimately zero
+        rc, up_out, _e = cmd_run(
+            ["git", "-C", str(path), "rev-parse", "--abbrev-ref", "@{u}"],
+            timeout=15)
+        unpushed = behind = 0
+        if rc == 0 and up_out.strip():
+            unpushed = sum(1 for ln in
+                           git(path, "log", "@{u}..HEAD", "--oneline").splitlines()
+                           if ln.strip())
+            behind = sum(1 for ln in
+                         git(path, "log", "HEAD..@{u}", "--oneline").splitlines()
+                         if ln.strip())
+        detached = (branch == "HEAD")
+        v: list[str] = []
+        if wts > rules.get("max_worktrees", 0):
+            v.append(f"worktrees={wts}")
+        if stashes > rules.get("max_stashes", 0):
+            v.append(f"stashes={stashes}")
+        # BOTH directions are drift: unpushed work can be lost, behind
+        # means the checkout is stale relative to the shared trunk.
+        if unpushed > rules.get("max_unpushed", 0):
+            v.append(f"unpushed={unpushed}")
+        if behind > rules.get("max_behind", 0):
+            v.append(f"behind={behind}")
+        if detached and rules.get("forbid_detached", True):
+            v.append("detached")
+        if dirty > 0:
+            v.append(f"dirty={dirty}")
+        mb_status = "off"
+        if rules.get("merged_branch_check", True):
+            states = pr_states(repo.get("remote"), path)
+            mb_v, mb_status = merged_branch_violations(
+                path, repo.get("remote"),
+                repo.get("default_branch", "main"), states)
+            v.extend(mb_v)
+        lm_status = "off"
+        if rules.get("local_merged_branch_check", True):
+            lm_status = "ok"
+            v.extend(local_merged_branch_violations(
+                path, repo.get("default_branch", "main"), branch))
+        v = list(dict.fromkeys(v))  # local+remote checks share the
+                                     # merged-branch-not-deleted prefix
+        return {"class": "git", "repo": name, "path": path, "branch": branch,
+                "dirty": dirty, "worktrees": wts, "stashes": stashes,
+                "unpushed": unpushed, "behind": behind, "detached": detached,
+                "fetch_ok": fetch_ok,
+                "merged_check": mb_status, "local_merged_check": lm_status,
+                "violations": v, "count": len(v)}
+    except Exception as e:  # never lose the whole run to one repo
+        return {"class": "git", "repo": name, "error": str(e),
+                "count": 1, "violations": ["exception"]}
+
+
+def main() -> int:
+    with open(YAML_PATH) as f:
+        cfg = yaml.safe_load(f)
+    ts = datetime.now(timezone.utc).isoformat()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    records = []
+    for repo in (cfg or {}).get("repos", []):
+        r = check(repo)
+        r["ts"] = ts
+        total += r["count"]
+        records.append(r)
+    # lib.jsonl.append takes an flock around write+fsync — the reconcile
+    # timer, SessionEnd hooks and manual runs can all append concurrently
+    # without tearing a line.
+    for r in records:
+        jsonl_append(OUT_PATH, r)
+    print(f"drift-git: {total} violations")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

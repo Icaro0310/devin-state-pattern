@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""drift-compliance — SKELETON: audit whether sessions followed the rules.
+
+WHY this check exists
+---------------------
+Operational rules written in AGENTS.md/DECISIONS.md decay the moment
+they're prose: everyone agrees with them, nobody can prove they were
+followed. This checker turns rules into *auditable claims* — after each
+session (or on demand) it replays the session's transcript/tool-calls
+against ``rules.yaml`` and writes one verdict per rule to an
+append-only ``compliance.jsonl`` ledger.
+
+It is deliberately **fail-open**: a compliance bug must never break or
+block a session. Worst case is a wrong UNVERIFIABLE/REVIEW row — honest
+uncertainty beats a false VIOLATION that trains people to ignore the
+ledger.
+
+Rule structure (``rules.yaml``)::
+
+    rules:
+      - id: R2                              # stable id, referenced in reports
+        name: "no --admin merges"           # human label
+        severity: high                      # critical|high|medium|low
+        source: "AGENTS.md#autonomia"       # where the rule is declared
+        check_type: deterministic           # see dispatch below
+        validated_against: ['session-a', 'session-b']  # sessions that
+        #   proved the check works; [] => UNVALIDATED (does not fire)
+        validation_deadline: "2026-12-14"    # escalate if still unvalidated
+        on_deadline_miss: "escalate to owner"
+        evidence: [transcript, git-guard]   # what the check may read
+        pattern: "gh\\s+pr\\s+merge.*--admin"  # deterministic only
+        exempt_pattern: "rules\\.yaml|check_type"  # lines that quote the
+        #   rule itself must not self-trigger (systemic FP otherwise)
+        negative_pattern: "--dry-run"       # same-line exemption only —
+        #   a session-wide exemption once hid every real violation
+        enforcement: "what the violation means / how to comply"
+        note: "semantic caveats for reviewers"
+
+check_type dispatch:
+
+- ``deterministic`` — regex ``pattern`` over the transcript; first
+  non-exempt match = VIOLATION. ``final_only: true`` restricts to the
+  tail after the last user message (closing-claim rules).
+- ``claims``        — negative claims ("I verified X") require a
+  ``verify_pattern`` hit in a preceding char window, else VIOLATION.
+- ``hybrid``        — deterministic pattern; if it fires -> VIOLATION,
+  else REVIEW/UNVERIFIABLE (semantic judgment needed).
+- ``custom``        — a Python function in CUSTOM_CHECKS (sequence
+  analysis, cross-ledger evidence — what regex can't express).
+- ``manual``        — not auto-auditable; always UNVERIFIABLE.
+
+Statuses written per rule::
+
+    VIOLATION | CLEAN | UNVERIFIABLE | REVIEW | UNVALIDATED | DEADLINE_MISSED
+
+validated_against is the anti-assumption gate: a check written against a
+*hypothesis* about the transcript format doesn't fire until it has been
+run against real sessions with zero false positives. ``--validate RID
+--against s1,s2`` does that and back-fills the field.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+RULES_PATH = Path(os.environ.get("RULES_YAML",
+                                ECOSYSTEM_ROOT / "rules.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_COMPLIANCE",
+                              STATE_DIR / "compliance.jsonl"))
+NOW = time.time()
+
+# TODO(adopt): point these at YOUR transcript/evidence stores. Common
+# sources: an append-only prompt log (session-<id>.jsonl), a sessions
+# database (sqlite, read-only URI), hook-fire ledgers. All loaders must
+# be best-effort and return "" / [] on failure — never raise.
+TRANSCRIPT_CANDIDATES: list[Path] = []
+
+
+def load_transcript(session_id: str, transcript_path: str) -> str:
+    """Best-effort transcript text for a session.
+
+    TODO(adopt): implement your sources, in preference order:
+      1. explicit transcript_path (hook payload) — read_text
+      2. session-<id>.jsonl prompt/tool log under your memory dir
+      3. sessions DB (sqlite `file:...?mode=ro`) — message_nodes style
+      4. hook-fires / executions ledgers filtered by session_id
+    """
+    if transcript_path:
+        try:
+            return Path(transcript_path).expanduser().read_text(
+                errors="replace")
+        except Exception:
+            pass
+    if session_id:
+        for p in TRANSCRIPT_CANDIDATES:
+            try:
+                cand = p / f"session-{session_id}.jsonl"
+                if cand.is_file():
+                    return cand.read_text(errors="replace")
+            except Exception:
+                continue
+    return ""
+
+
+# ---------------------------------------------------------- checks
+
+def _in_code_span(line: str, start: int, end: int) -> bool:
+    """True if [start,end) sits inside a `...` span — quoted mentions are
+    not executions. Exemption is by MATCH POSITION, not by line: a line
+    containing both a mention and a real command must still flag the
+    real one."""
+    if line[:start].count("`") % 2 == 0:
+        return False
+    return "`" in line[end:]
+
+
+def agent_only_text(text: str) -> str:
+    """Keep only lines emitted by the agent ([assistant] role marker).
+
+    Deterministic checks must not match rules injected into the system
+    prompt, user messages, or file contents read by tools — those are
+    context, not behavior. TODO(adopt): match YOUR transcript's role
+    markers (e.g. '[assistant]', '"role": "assistant"')."""
+    lines = [ln for ln in text.splitlines()
+             if ln.lstrip().startswith("[assistant]")]
+    return "\n".join(lines)
+
+
+def check_deterministic(rule: dict, text: str, ctx: dict) -> tuple:
+    """-> (violated: bool|None, evidence: str). None = not evaluable.
+
+    Iterates ALL matches: lines matching ``exempt_pattern`` (the rule's
+    own text quoted back, docs, examples) are skipped — without this the
+    pattern matches rules.yaml/docs inside the transcript (systemic
+    false positive). ``negative_pattern`` exempts per-LINE only; a
+    session-wide exemption once masked every real violation."""
+    pat = rule.get("pattern")
+    neg = rule.get("negative_pattern")
+    exempt = rule.get("exempt_pattern")
+    if not pat:
+        return None, "sem pattern"
+    try:
+        rx = re.compile(pat, re.IGNORECASE | re.MULTILINE)
+        erx = re.compile(exempt, re.IGNORECASE) if exempt else None
+        nrx = re.compile(neg, re.IGNORECASE) if neg else None
+    except re.error:
+        return None, "regex inválido"
+    negated = 0
+    for m in rx.finditer(text):
+        ls = text.rfind("\n", 0, m.start()) + 1
+        le = text.find("\n", m.end())
+        line = text[ls: le if le != -1 else len(text)]
+        if _in_code_span(line, m.start() - ls, m.end() - ls):
+            continue
+        if erx and erx.search(line):
+            continue
+        if nrx and nrx.search(line):
+            negated += 1
+            continue
+        frag = m.group(0)[:120]
+        if rule.get("redact_evidence"):
+            frag = re.sub(r"([:=]\s*['\"]?)[^'\"\s]{8,}",
+                          r"\1<redacted>", frag)
+        return True, f"match: '{frag}'"
+    if negated:
+        return False, (f"sem match efectivo ({negated} matches isentos "
+                       "por negative_pattern na mesma linha)")
+    return False, "sem match"
+
+
+def check_claims(rule: dict, text: str, ctx: dict, base: dict) -> dict:
+    """Negative-claim rule: "I verified/did X" requires a
+    ``verify_pattern`` hit within ``verify_window`` chars BEFORE the
+    claim. Claims in user/system lines or exempt lines don't count."""
+    pat = rule.get("pattern")
+    vpat = rule.get("verify_pattern")
+    if not pat or not text:
+        return {**base, "status": "UNVERIFIABLE", "violation": False,
+                "evidence": "", "detail": "claims sem pattern/transcript"}
+    try:
+        rx = re.compile(pat, re.IGNORECASE)
+        vrx = re.compile(vpat, re.IGNORECASE) if vpat else None
+        erx = re.compile(rule.get("exempt_pattern", r"rules\.yaml"),
+                         re.IGNORECASE)
+    except re.error as e:
+        return {**base, "status": "UNVERIFIABLE", "violation": False,
+                "evidence": "", "detail": f"regex inválido: {e}"}
+    window = int(rule.get("verify_window", 10000))
+    bad, n_claims = [], 0
+    for m in rx.finditer(text):
+        ls = text.rfind("\n", 0, m.start()) + 1
+        le = text.find("\n", m.end())
+        line = text[ls: le if le != -1 else len(text)]
+        if re.match(r"\s*\[(user|human|system)\]", line):
+            continue
+        if erx.search(line):
+            continue
+        n_claims += 1
+        before = text[max(0, m.start() - window):m.start()]
+        if vrx and vrx.search(before):
+            continue
+        bad.append(m.group(0)[:80])
+        if len(bad) >= 3:
+            break
+    if bad:
+        return {**base, "status": "VIOLATION", "violation": True,
+                "evidence": f"sem verificação prévia: '{bad[0]}'",
+                "detail": rule.get("enforcement", "")}
+    return {**base, "status": "CLEAN", "violation": False,
+            "evidence": (f"{n_claims} claims verificadas" if n_claims
+                         else "sem afirmações negativas"),
+            "detail": ""}
+
+
+# ------------------------------------------------ custom checks
+# TODO(adopt): implement the custom checks YOUR rules reference. Each
+# signature: fn(rule, text, ctx, base) -> result-dict (same shape as
+# check_rule). Registry key = rule id string.
+CUSTOM_CHECKS: dict = {}
+
+
+def _cres(rule, base, status, violation, evidence="", detail=""):
+    return {**base, "status": status, "violation": violation,
+            "evidence": evidence, "detail": detail}
+
+
+# ---------------------------------------------------------- dispatch
+
+def check_rule(rule: dict, text: str, ctx: dict) -> dict:
+    """Dispatch one rule -> {status, violation, evidence, detail,...}."""
+    rid, ctype = rule.get("id"), rule.get("check_type", "manual")
+    base = {"rule_id": rid, "severity": rule.get("severity", "medium"),
+            "check_type": ctype}
+
+    if not text:
+        return {**base, "status": "UNVERIFIABLE", "violation": False,
+                "evidence": "", "detail": "sem transcript"}
+
+    if ctype == "claims":
+        atext = agent_only_text(text) or text
+        return check_claims(rule, atext, ctx, base)
+
+    # validated_against gate: a rule with an EMPTY list has never been
+    # proven against real sessions — it reports UNVALIDATED and does not
+    # fire. This closes the "check written against a false assumption
+    # about the transcript" class of bugs.
+    if "validated_against" in rule and not rule.get("validated_against"):
+        return {**base, "status": "UNVALIDATED", "violation": False,
+                "evidence": "",
+                "detail": "sem validacao contra sessoes reais"}
+
+    if ctype == "manual":
+        return {**base, "status": "UNVERIFIABLE", "violation": False,
+                "evidence": "", "detail": rule.get("note", "manual")}
+
+    if ctype == "deterministic":
+        if rule.get("final_only"):
+            # closing-claim rules: only what the agent says AFTER the
+            # last user message counts — interim check-ins are normal
+            ui = text.rfind("\n[user]")
+            tail = text[ui + 1:] if ui != -1 else text
+            atext = agent_only_text(tail) or tail
+        else:
+            atext = agent_only_text(text) or text
+        violated, ev = check_deterministic(rule, atext, ctx)
+        if violated is None:
+            return {**base, "status": "UNVERIFIABLE", "violation": False,
+                    "evidence": "", "detail": "pattern não avaliável"}
+        if violated:
+            return {**base, "status": "VIOLATION", "violation": True,
+                    "evidence": ev, "detail": rule.get("enforcement", "")}
+        return {**base, "status": "CLEAN", "violation": False,
+                "evidence": ev, "detail": ""}
+
+    if ctype == "custom":
+        fn = CUSTOM_CHECKS.get(str(rid))
+        if not fn:
+            return {**base, "status": "UNVERIFIABLE", "violation": False,
+                    "evidence": "", "detail": "custom check não implementado"}
+        return fn(rule, text, ctx, base)
+
+    if ctype == "hybrid":
+        pat = rule.get("pattern")
+        if pat:
+            atext = agent_only_text(text) or text
+            violated, ev = check_deterministic(rule, atext, ctx)
+            if violated:
+                return {**base, "status": "VIOLATION", "violation": True,
+                        "evidence": ev,
+                        "detail": rule.get("enforcement", "")}
+        return {**base, "status": "UNVERIFIABLE", "violation": False,
+                "evidence": "",
+                "detail": rule.get("note", "hybrid — requer revisão")}
+
+    return {**base, "status": "UNVERIFIABLE", "violation": False,
+            "evidence": "", "detail": "check_type desconhecido"}
+
+
+# ------------------------------------------------------------- main
+
+def parse_args(argv: list[str]) -> tuple:
+    """(session_id, transcript_path, self_check, no_write)."""
+    self_check = "--self-check" in argv
+    no_write = "--no-write" in argv
+    sid, tpath = "", ""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--session" and i + 1 < len(argv):
+            sid = argv[i + 1]; i += 2
+        elif a in ("--transcript", "--transcript-file") \
+                and i + 1 < len(argv):
+            tpath = argv[i + 1]; i += 2
+        else:
+            i += 1
+    for ev in ("DEVIN_SESSION_ID", "DEVIN_SESSION", "SESSION_ID",
+               "CLAUDE_SESSION_ID"):
+        if os.environ.get(ev):
+            sid = sid or os.environ[ev]
+            break
+    tpath = tpath or os.environ.get("DEVIN_TRANSCRIPT_PATH", "")
+    # TODO(adopt): stdin hook payload {"session_id","transcript_path"}
+    # if not sid and not tpath and not sys.stdin.isatty():
+    #     try: ... json.loads(sys.stdin.read()) ...
+    #     except Exception: pass
+    return sid, tpath, self_check, no_write
+
+
+def main(argv: list[str]) -> int:
+    try:
+        rules = (yaml.safe_load(RULES_PATH.read_text()) or {}).get(
+            "rules", [])
+    except Exception as e:
+        print(f"compliance: FATAL rules.yaml: {e}", file=sys.stderr)
+        return 0  # fail-open: a rules bug must not break sessions
+    if not rules:
+        return 0
+
+    sid, tpath, self_check, no_write = parse_args(argv)
+    text = load_transcript(sid, tpath)
+    ctx = {"session_id": sid, "has_transcript": bool(text)}
+
+    results = []
+    for rule in rules:
+        r = check_rule(rule, text, ctx)
+        r.update({"ts": NOW, "session_id": sid,
+                  "self_check": bool(self_check)})
+        results.append(r)
+
+    if not no_write:
+        try:
+            OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            for r in results:
+                jsonl_append(OUT_PATH, r)
+        except OSError as e:
+            print(f"compliance: FATAL out: {e}", file=sys.stderr)
+            return 0
+
+    nviol = sum(1 for r in results if r.get("violation"))
+    nunv = sum(1 for r in results
+               if r.get("status") in ("UNVERIFIABLE", "UNVALIDATED"))
+    print(f"compliance: session={sid or '?'} rules={len(results)} "
+          f"violations={nviol} unverifiable={nunv}")
+    if self_check:
+        for r in results:
+            if r.get("violation") or r.get("status") in (
+                    "UNVERIFIABLE", "UNVALIDATED"):
+                print(f"  [{r['status']:11s}] {r['rule_id']:4s} "
+                      f"{r.get('evidence', '')[:60]}")
+        return 1 if nviol else 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

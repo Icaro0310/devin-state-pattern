@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""drift-daemons — declared timers/cron/services vs system reality.
+
+WHY this check exists
+---------------------
+Automation rots silently: a systemd timer gets masked during debugging
+and never unmasked, a cron line is removed by "cleanup", a pm2 process
+crashes and stays dead. Nothing errors — the job just stops happening,
+and the first symptom is a report that was supposed to arrive weekly.
+
+This check compares a *declaration* (``daemons.yaml``: what SHOULD be
+running, on which host, expected state) against probes of reality
+(``systemctl is-active``, ``crontab -l``, ``pm2 jlist``, ``ssh``).
+One record per daemon per run lands in the shared ``drift.jsonl``
+ledger.
+
+Declaration shape::
+
+    hosts:
+      laptop:    { kind: local }
+      build-vm:  { kind: ssh, target: user@host, port: 22 }
+    daemons:
+      - name: my-nightly-job        # TODO(adopt): your daemon name
+        host: laptop                # TODO(adopt): a key under hosts:
+        kind: systemd-user-timer    # or cron | systemd | pm2
+        unit: my-nightly-job.timer  # TODO(adopt): for systemd* kinds
+        expected: active            # for systemd*/pm2
+        marker: my-nightly-job      # TODO(adopt): for cron: substring in crontab -l
+        schedule: "30 4 * * *"      # documentation only
+        host_down_ok: true          # ssh host unreachable != daemon drift
+
+Design decisions worth keeping:
+
+- **SSH probes are cached per run** — N daemons on the same host must not
+  pay N connection setups; one ``ssh ... true`` proves reachability.
+- **``host_down_ok``**: an unreachable remote host is infra drift, not
+  daemon drift. Declaring it avoids double-alerting on the same root
+  cause (and the infra monitor owns that alert).
+- **Cron detection is substring+schedule aware**: the marker must appear
+  on an *active* (non-commented) crontab line containing ``*`` — comments
+  and disabled lines don't count as "running".
+- **pm2** parses ``pm2 jlist`` JSON and compares ``pm2_env.status`` —
+  a process can exist but be ``stopped``/``errored``, which is drift.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+# TODO(adopt): point ECOSYSTEM_ROOT at the directory that contains your
+# declared-state YAMLs (daemons.yaml etc.). Env override keeps tests and
+# one-off runs honest.
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),  # state/bin -> state/
+))
+YAML_PATH = Path(os.environ.get("DAEMONS_YAML",
+                               ECOSYSTEM_ROOT / "daemons.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+
+
+def run_remote(cmd: str, host: dict, timeout: int = 20) -> str:
+    """Run ``cmd`` on the declared host; '' on any failure (fail-open)."""
+    if host.get("kind") == "local":
+        rc, out, _e = cmd_run(cmd, timeout=timeout, shell=True)
+        return out if rc == 0 else ""
+    if host.get("kind") == "ssh":
+        target = host.get("target")
+        if not target:
+            return ""
+        ssh_cmd = ["ssh",
+                   "-p", str(host.get("port", 22)),
+                   "-o", "BatchMode=yes",
+                   "-o", "ConnectTimeout=5",
+                   "-o", "StrictHostKeyChecking=accept-new",
+                   str(target), cmd]
+        rc, out, _e = cmd_run(ssh_cmd, timeout=timeout + 5)
+        return out if rc == 0 else ""
+    return ""
+
+
+_host_up_cache: dict[str, bool] = {}
+
+
+def host_reachable(host: dict) -> bool:
+    """True if an ssh host answers ``true``; cached per run.
+
+    Only meaningful for ``kind: ssh`` — local hosts are always
+    'reachable' (if localhost is down, everything is down anyway).
+    """
+    if host.get("kind") != "ssh":
+        return True
+    key = str(host.get("target"))
+    if key not in _host_up_cache:
+        ssh_cmd = ["ssh",
+                   "-p", str(host.get("port", 22)),
+                   "-o", "BatchMode=yes",
+                   "-o", "ConnectTimeout=5",
+                   key, "true"]
+        rc, _o, _e = cmd_run(ssh_cmd, timeout=15)
+        _host_up_cache[key] = rc == 0
+    return _host_up_cache[key]
+
+
+def check(d: dict, hosts: dict) -> dict:
+    """Probe one declared daemon; ALWAYS returns a record."""
+    host = hosts.get(d.get("host"), {})
+    kind = d.get("kind")
+    name = d.get("name", "?")
+    hname = d.get("host", "?")
+    ok = False
+    detail = ""
+    try:
+        if host.get("kind") == "ssh" and not host_reachable(host):
+            if d.get("host_down_ok"):
+                return {"class": "daemons", "daemon": name, "host": hname,
+                        "ok": True, "detail": "host-unreachable(allowed)",
+                        "violations": [], "count": 0}
+            return {"class": "daemons", "daemon": name, "host": hname,
+                    "ok": False, "detail": "host-unreachable",
+                    "violations": [f"{name}@{hname}=host-unreachable"],
+                    "count": 1}
+        if kind == "systemd-user-timer":
+            unit = d["unit"]
+            cmd = (f"systemctl --user is-active {unit}"
+                   if host.get("kind") == "local"
+                   else f"systemctl is-active {unit}")
+            out = run_remote(cmd, host)
+            ok = out.strip() == d.get("expected", "active")
+            detail = out.strip() or "no-output"
+        elif kind == "systemd":
+            out = run_remote(f"systemctl is-active {d['unit']}", host)
+            ok = out.strip() == d.get("expected", "active")
+            detail = out.strip() or "no-output"
+        elif kind == "cron":
+            out = run_remote("crontab -l 2>/dev/null", host)
+            marker = d.get("marker", name)
+            ok = any(marker in ln and "*" in ln
+                     for ln in out.splitlines())
+            detail = "present" if ok else "missing"
+        elif kind == "pm2":
+            out = run_remote("pm2 jlist 2>/dev/null", host)
+            try:
+                arr = json.loads(out or "[]")
+                proc = next((p for p in arr
+                             if p.get("name") == d.get("process")), None)
+                ok = (proc is not None and
+                      proc.get("pm2_env", {}).get("status")
+                      == d.get("expected", "online"))
+                detail = (proc.get("pm2_env", {}).get("status")
+                          if proc else "absent")
+            except Exception:
+                detail = "parse_error"
+        else:
+            detail = f"unknown-kind:{kind}"
+    except Exception as e:
+        detail = str(e)
+    return {"class": "daemons", "daemon": name, "host": hname,
+            "ok": ok, "detail": detail,
+            "violations": [] if ok else [f"{name}@{hname}={detail}"],
+            "count": 0 if ok else 1}
+
+
+def main() -> int:
+    with open(YAML_PATH) as f:
+        cfg = yaml.safe_load(f)
+    cfg = cfg or {}
+    ts = datetime.now(timezone.utc).isoformat()
+    results = [check(d, cfg.get("hosts") or {})
+               for d in cfg.get("daemons", [])]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        r["ts"] = ts
+        jsonl_append(OUT_PATH, r)
+    print(f"drift-daemons: {sum(r['count'] for r in results)} violations")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

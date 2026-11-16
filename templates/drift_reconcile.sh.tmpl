@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# drift_reconcile.sh — run every enabled drift_* reconciler, collect results.
+#
+# WHY a shell orchestrator (not a Python driver):
+#   - Each drift_*.py is an independent probe with its own timeout and its
+#     own failure mode. `timeout` + sequential execution keeps one hung
+#     probe from wedging the sweep, and journalctl shows per-class runtime.
+#   - Reconcilers append their own findings to drift.jsonl — the runner only
+#     sequences them and reports exit codes. No shared state, no import graph.
+#
+# Contract:
+#   - Each checker MUST append findings to drift.jsonl itself (via lib.jsonl)
+#     and exit 0 on "ran fine" — findings are data, not errors. Nonzero exit
+#     means the probe itself failed (bad config, missing dep, wedged).
+#   - Which checkers run is driven by reconciliation.yaml `classes:` — each
+#     entry names a `checker:` file under bin/. Classes with
+#     `enabled: false` stay declared but paused (better than deleting:
+#     the manifest still documents intent).
+#   - Session-scoped checkers (e.g. a compliance auditor that reads session
+#     transcripts) do NOT belong in the daily sweep — keep them out of
+#     `classes:` or give them a different filename prefix.
+#
+# TODO(adopt):
+#   - ECOSYSTEM_ROOT defaults to the parent of this script's dir; override
+#     via env for systemd (which does not expand env vars in ExecStart —
+#     bake the literal path into the unit instead).
+#   - Per-class timeout: export TIMEOUT_<CHECKER_BASENAME_UPPER> e.g.
+#     TIMEOUT_DRIFT_GIT=300 before invoking, or edit TIMEOUT_DEFAULT.
+set -uo pipefail   # NOT -e: a failing class must not abort the sweep
+
+ECOSYSTEM_ROOT="${ECOSYSTEM_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+BIN_DIR="$ECOSYSTEM_ROOT/bin"
+STATE_YAML="$ECOSYSTEM_ROOT/reconciliation.yaml"
+RUNLOG="${DRIFT_STATE_DIR:-$HOME/.local/state/devin}/drift.jsonl.runlog"
+TIMEOUT_DEFAULT="${TIMEOUT_DEFAULT:-120}"
+
+log() { printf '[reconcile %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+# enabled_checkers — print checker filenames for classes with enabled:true.
+# Parses the flow-style map entries under `classes:` (2-space indent under
+# `reconciliation:`). If the file/section is absent, prints nothing and the
+# caller falls back to globbing bin/drift_*.py.
+enabled_checkers() {
+    [ -f "$STATE_YAML" ] || return 0
+    awk '
+        /^  classes:/          { inblock=1; next }
+        inblock && /^  \S/     { inblock=0 }          # sibling key at same indent
+        inblock && /^    \S/ && /enabled:[[:space:]]*true/ {
+            if (match($0, /checker:[[:space:]]*[A-Za-z0-9_.-]+/)) {
+                c = substr($0, RSTART, RLENGTH)
+                sub(/^checker:[[:space:]]*/, "", c)
+                print c
+            }
+        }
+    ' "$STATE_YAML"
+}
+
+# --- resolve the work list --------------------------------------------------
+mapfile -t checkers < <(enabled_checkers)
+if [ ${#checkers[@]} -eq 0 ]; then
+    # fail-open to coverage: no config -> run every drift_*.py present
+    shopt -s nullglob
+    for f in "$BIN_DIR"/drift_*.py; do checkers+=("$(basename "$f")"); done
+    [ ${#checkers[@]} -eq 0 ] && { log "FAIL: no checkers in $BIN_DIR and none enabled in $STATE_YAML"; exit 2; }
+    log "no enabled classes parsed — running all drift_*.py (${#checkers[@]})"
+fi
+
+rc_overall=0; ran=0
+for checker in "${checkers[@]}"; do
+    path="$BIN_DIR/$checker"
+    if [ ! -f "$path" ]; then
+        log "FAIL $checker — declared in reconciliation.yaml but missing in $BIN_DIR"
+        rc_overall=1; continue
+    fi
+
+    var_name="TIMEOUT_$(echo "${checker%.py}" | tr 'a-z.-' 'A-Z__')"
+    timeout_s="${!var_name:-$TIMEOUT_DEFAULT}"
+
+    log "RUN  $checker (timeout ${timeout_s}s)"
+    start=$(date +%s)
+    timeout "$timeout_s" python3 "$path" >>"$RUNLOG" 2>&1
+    rc=$?
+    dur=$(( $(date +%s) - start ))
+
+    case $rc in
+        0)   log "OK      $checker (${dur}s)" ;;
+        124) log "TIMEOUT $checker after ${timeout_s}s — probe wedged, sweep continues"; rc_overall=1 ;;
+        *)   log "FAIL    $checker rc=$rc (${dur}s) — probe error, see $RUNLOG"; rc_overall=1 ;;
+    esac
+    ran=$((ran+1))
+done
+
+log "DONE ran=$ran rc=$rc_overall"
+exit $rc_overall

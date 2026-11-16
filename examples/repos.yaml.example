@@ -1,0 +1,48 @@
+# repos.yaml — declare every git repository in your ecosystem and the
+# hygiene limits the reconciler enforces on it.
+#
+# Consumed by drift checks (e.g. state/bin/drift_git.py): for each entry the
+# checker compares `git status`, `git stash list`, `git worktree list` and
+# ahead/behind counts against the limits below, then alerts on violations.
+#
+# Field reference:
+#   name             short unique id used in alerts/logs (usually repo name)
+#   path             absolute path of the PRIMARY checkout on this machine.
+#                    ~ expands to the service account home; otherwise write
+#                    the real absolute path for your layout.
+#   remote           clone URL or "owner/repo" slug — used to match hosting
+#                    PRs and to detect renamed/moved remotes.
+#   default_branch   branch that counts as "clean upstream" (usually main).
+#   rules.max_worktrees   max entries allowed in `git worktree list`
+#                         (the main checkout counts as one).
+#   rules.max_stashes     max entries allowed in `git stash list`.
+#   rules.max_unpushed    max commits allowed ahead of upstream
+#                         (0 = everything must be pushed).
+#   rules.forbid_detached HEAD must never be detached in this repo — set
+#                         false only for read-only mirrors you never commit in.
+
+repos:
+  # Strict repo: single checkout, zero stashes, everything pushed,
+  # detached HEAD forbidden.
+  - name: webapp
+    path: ~/code/example-org/webapp
+    remote: example-org/webapp
+    default_branch: main
+    rules: { max_worktrees: 1, max_stashes: 0, max_unpushed: 0, forbid_detached: true }
+
+  # Busier repo: a few long-lived worktrees and one emergency stash are
+  # tolerated; detached HEAD still forbidden, nothing unpushed.
+  - name: api
+    path: ~/code/example-org/api
+    remote: example-org/api
+    default_branch: main
+    rules: { max_worktrees: 3, max_stashes: 1, max_unpushed: 0, forbid_detached: true }
+
+  # Read-only mirror clone: detached HEAD is EXPECTED here (it tracks
+  # origin/main), stashes are meaningless but capped anyway. Keep
+  # max_unpushed: 0 — you should never commit into a mirror.
+  - name: docs-mirror
+    path: ~/code/mirrors/docs-site
+    remote: example-org/docs-site
+    default_branch: main
+    rules: { max_worktrees: 1, max_stashes: 0, max_unpushed: 0, forbid_detached: false }

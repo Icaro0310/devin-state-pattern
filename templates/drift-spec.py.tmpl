@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""drift-spec — declared spec/pin vs what environments actually run.
+
+WHY this check exists
+---------------------
+When several environments (dev venvs, uv tools, daemons) consume a shared
+versioned contract — a PyPI package plus a schema constant like
+``LATEST_KNOWN_SCHEMA`` — drift has a specific, dangerous shape:
+
+- an env lags the pin        -> it can't read data the others write;
+- an env runs ahead of the pin -> it writes data others can't read;
+- the state DB's real schema exceeds what the *installed fleet* knows
+  -> the whole ecosystem fails closed on next read (this actually
+  happened: a spec merged to main != spec released, and the DB was
+  ahead of every installed env).
+
+The reference that matters for (3) is the MINIMUM ``LATEST_KNOWN``
+across installed environments — the weakest link decides what the fleet
+can safely read — falling back to the canonical repo checkout when
+nothing is installed.
+
+Declaration shape (``fleet.yaml``)::
+
+    fleet:
+      spec:
+        canonical_repo: /abs/path/to/spec-repo     # TODO(adopt)
+        pypi_package: my-spec-package              # TODO(adopt)
+        pinned_version: "1.2.3"                    # TODO(adopt)
+        state_db: /path/to/state.db                # TODO(adopt)
+        import_probe: "from my_spec.schema import LATEST_KNOWN_SCHEMA as k;print(k)"
+        db_probe: "from my_spec.schema import detect_schema_version as d;print(d('<state_db>'))"
+                                             # TODO(adopt): prints real DB schema
+      dev_venvs:
+        - path: /abs/path/.venv                    # TODO(adopt)
+      uv_tools:
+        - name: my-tool                            # TODO(adopt)
+
+Checks emitted (one record each, ``class: "spec"``):
+
+- ``pypi_vs_pin``       — PyPI latest != pinned (pin went stale)
+- ``venv_missing``      — declared venv has no python binary
+- ``venv_version``      — installed spec version != pinned (only when
+                          the spec IS installed — a venv that doesn't
+                          depend on it is not drift)
+- ``uv_tool_version``   — same for uv-managed tools
+- ``uv_tool_missing``   — declared tool not installed at all
+- ``schema_gap``        — state_db schema > min(LATEST_KNOWN) of fleet
+- ``pypi_unreachable`` / ``spec_import_failed`` — probe failures are
+  reported, never silently treated as OK
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+YAML_PATH = Path(os.environ.get("FLEET_YAML", ECOSYSTEM_ROOT / "fleet.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+
+# TODO(adopt): where uv keeps tool venvs. Linux default shown; macOS uses
+# ~/Library/Application Support/uv/tools — detect or make configurable.
+UV_TOOL_ROOT = Path(os.environ.get(
+    "UV_TOOL_ROOT",
+    str(Path.home() / ".local" / "share" / "uv" / "tools")))
+
+
+def py_run(code: str, python: str = sys.executable,
+           timeout: int = 30) -> tuple[int, str]:
+    """Run ``python -c <code>``; returns (rc, stdout). Never raises."""
+    rc, out, _e = cmd_run([python, "-c", code], timeout=timeout)
+    return rc, out.strip()
+
+
+def pypi_latest(pkg: str, timeout: int = 30) -> str | None:
+    """Latest version on PyPI via JSON API (stdlib only, no `pip index`)."""
+    code = (
+        "import json,urllib.request,sys;"
+        f"print(json.load(urllib.request.urlopen("
+        f"'https://pypi.org/pypi/{pkg}/json', timeout=20))"
+        "['info']['version'])")
+    rc, out = py_run(code, timeout=timeout)
+    return out if rc == 0 and out else None
+
+
+def pkg_version(python: str, pkg: str) -> str | None:
+    """Installed version of ``pkg`` in the env at ``python``.
+
+    Uses ``uv pip show --python <py>`` when uv is present — uv-managed
+    venvs have no pip module, so ``pip show`` would false-negative.
+    Falls back to reading ``<pkg>-*.dist-info/METADATA`` directly.
+    """
+    rc, out, _e = cmd_run(["uv", "pip", "show", "--python", python, pkg],
+                          timeout=30)
+    if rc == 0:
+        m = re.search(r"(?im)^version:\s*(\S+)", out)
+        if m:
+            return m.group(1)
+    # fallback: dist-info METADATA — no subprocess into the target env
+    site = Path(python).resolve().parent.parent / "lib"
+    try:
+        for di in sorted(site.glob(f"python*/site-packages/{pkg}-*.dist-info")):
+            meta = di / "METADATA"
+            if meta.is_file():
+                for line in meta.read_text(errors="replace").splitlines():
+                    if line.startswith("Version:"):
+                        return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def uv_tool_names() -> list[str]:
+    """Names of installed uv tools (``uv tool list``)."""
+    rc, out, _e = cmd_run(["uv", "tool", "list"], timeout=30)
+    if rc != 0:
+        return []
+    names = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line and not line.startswith("-") and " v" in line:
+            names.append(line.split()[0])
+    return names
+
+
+def spec_known_latest(probe_code: str, canonical_repo: str) -> int | None:
+    """``LATEST_KNOWN_SCHEMA`` from the canonical repo checkout.
+
+    ``probe_code`` is a python -c snippet (see fleet.yaml
+    ``import_probe``); the canonical repo's source root is prepended to
+    sys.path so the *source of truth* version is importable.
+    """
+    src = Path(canonical_repo) / "src"
+    code = (f"import sys; sys.path.insert(0, {str(src)!r});"
+            + probe_code)
+    rc, out = py_run(code)
+    try:
+        return int(out)
+    except (ValueError, TypeError):
+        return None
+
+
+def env_known_latest(python: str, probe_code: str) -> int | None:
+    """``LATEST_KNOWN_SCHEMA`` as seen by ONE installed env.
+
+    The weakest env counts: if any installed env knows less than the DB
+    requires, reads fail closed — so we take the MIN across envs.
+    """
+    rc, out = py_run(probe_code, python=python)
+    try:
+        return int(out)
+    except (ValueError, TypeError):
+        return None
+
+
+def installed_spec_pythons(cfg: dict) -> list[str]:
+    """Interpreters that actually have the spec package installed
+    (declared venvs + uv tools). Envs without it are skipped — absence
+    is not drift."""
+    spec = cfg["spec"]
+    pkg = spec["pypi_package"]
+    out = []
+    for v in cfg.get("dev_venvs", []):
+        py = os.path.join(v["path"], "bin", "python")
+        if os.path.isfile(py) and pkg_version(py, pkg):
+            out.append(py)
+    for name in uv_tool_names():
+        py = str(UV_TOOL_ROOT / name / "bin" / "python")
+        if os.path.isfile(py) and pkg_version(py, pkg):
+            out.append(py)
+    return out
+
+
+def db_schema_version(db_path: str, canonical_repo: str,
+                      detect_code: str) -> int | None:
+    """Real schema version of the state DB.
+
+    ``detect_code`` is a python -c snippet that must print the numeric
+    version — typically it imports the canonical spec's own
+    ``detect_schema_version(db_path)`` so the spec owns the DB->version
+    mapping (never raw sqlite pragmas). The canonical repo's src root is
+    prepended to sys.path so the SOURCE spec is imported, not whatever
+    happens to be installed."""
+    src = Path(canonical_repo) / "src"
+    code = (f"import sys; sys.path.insert(0, {str(src)!r});"
+            + detect_code)
+    rc, out = py_run(code)
+    try:
+        return int(out)
+    except (ValueError, TypeError):
+        return None
+
+
+def main() -> int:
+    with open(YAML_PATH) as f:
+        cfg = yaml.safe_load(f)
+    fleet = (cfg or {}).get("fleet") or {}
+    spec = fleet.get("spec") or {}
+    pinned = str(spec.get("pinned_version", ""))
+    pkg = spec.get("pypi_package", "")
+    probe = spec.get("import_probe",
+                     "from my_spec.schema import LATEST_KNOWN_SCHEMA as k;"
+                     "print(k)")
+    ts = datetime.now(timezone.utc).isoformat()
+    results: list[dict] = []
+
+    # 1) PyPI latest vs pinned — is the declared pin stale?
+    latest = pypi_latest(pkg) if pkg else None
+    if pkg and latest is None:
+        results.append({"class": "spec", "check": "pypi_unreachable",
+                        "violations": ["pypi_unreachable"], "count": 1})
+    elif latest is not None and latest != pinned:
+        results.append({"class": "spec", "check": "pypi_vs_pin",
+                        "latest": latest, "pinned": pinned,
+                        "violations": [f"pypi_latest={latest}!={pinned}"],
+                        "count": 1})
+
+    # 2) declared dev venvs: only flag when spec installed AND diverged
+    for v in fleet.get("dev_venvs", []):
+        path = v["path"]
+        python = os.path.join(path, "bin", "python")
+        if not os.path.isfile(python):
+            results.append({"class": "spec", "check": "venv_missing",
+                            "venv": path,
+                            "violations": ["venv_missing"], "count": 1})
+            continue
+        installed = pkg_version(python, pkg) if pkg else None
+        if installed is not None and installed != pinned:
+            results.append({"class": "spec", "check": "venv_version",
+                            "venv": path, "installed": installed,
+                            "pinned": pinned,
+                            "violations": [f"venv={installed}!={pinned}"],
+                            "count": 1})
+
+    # 3) uv tools: flag installed-version drift + declared-but-missing
+    declared = {t["name"]: t for t in fleet.get("uv_tools", [])}
+    installed_names = set(uv_tool_names())
+    for name in sorted(installed_names):
+        py = UV_TOOL_ROOT / name / "bin" / "python"
+        if not py.is_file():
+            continue
+        installed = pkg_version(str(py), pkg) if pkg else None
+        if installed is None:
+            continue  # tool doesn't carry the spec — not our business
+        if installed != pinned:
+            results.append({"class": "spec", "check": "uv_tool_version",
+                            "tool": name, "installed": installed,
+                            "pinned": pinned,
+                            "violations":
+                                [f"uv_tool:{name}={installed}!={pinned}"],
+                            "count": 1})
+    for name in declared:
+        if name not in installed_names:
+            results.append({"class": "spec", "check": "uv_tool_missing",
+                            "tool": name,
+                            "violations": [f"uv_tool:{name}=missing"],
+                            "count": 1})
+
+    # 4) state DB schema vs the WEAKEST installed env (fail-closed).
+    #    Reference = min(LATEST_KNOWN) over envs that have the spec;
+    #    fallback = canonical repo when nothing is installed.
+    envs = installed_spec_pythons(fleet)
+    fleet_known = [k for k in
+                   (env_known_latest(p, probe) for p in envs)
+                   if k is not None]
+    known = (min(fleet_known) if fleet_known
+             else spec_known_latest(probe, spec.get("canonical_repo", "")))
+    # TODO(adopt): db_probe must print the DB's real schema version —
+    # e.g. "from my_spec.schema import detect_schema_version as d;"
+    #        "print(d('<db_path>'))"  (db_path interpolated below)
+    detect = spec.get(
+        "db_probe",
+        "from my_spec.schema import detect_schema_version as d;"
+        f"print(d({spec.get('state_db', '')!r}))")
+    real = (db_schema_version(spec.get("state_db", ""),
+                              spec.get("canonical_repo", ""), detect)
+            if known is not None else None)
+    if known is None:
+        results.append({"class": "spec", "check": "spec_import_failed",
+                        "violations": ["spec_import_failed"], "count": 1})
+    elif real is not None and real > known:
+        results.append({"class": "spec", "check": "schema_gap",
+                        "real": real, "known_max": known, "ref": "fleet_min",
+                        "violations": [f"schema={real}>fleet_known={known}"],
+                        "count": 1})
+
+    if not results:
+        results.append({"class": "spec", "check": "ok",
+                        "violations": [], "count": 0})
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        r["ts"] = ts
+        jsonl_append(OUT_PATH, r)
+    print(f"drift-spec: {sum(r['count'] for r in results)} violations")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

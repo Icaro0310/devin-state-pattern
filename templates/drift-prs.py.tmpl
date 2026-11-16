@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""drift-prs — open PRs vs declared expectations (checks state + age).
+
+WHY this check exists
+---------------------
+"UNSTABLE" on a PR list is opaque: it can mean CI is queued, failing, or
+just slow — and each needs a different response (wait / fix / investigate
+infra). This check resolves the ambiguity: every open PR in the declared
+repos gets a verdict — ``pass`` | ``queued`` | ``fail`` | ``unknown`` —
+plus an age-aware violation when checks stay queued past the threshold.
+
+It is the *human-facing* complement of drift-deps: deps tracks bot PRs,
+this tracks the PRs people (and agents) actually opened — the ones that
+silently rot while review queues move on.
+
+Declaration shape (``prs.yaml``)::
+
+    prs:
+      repos: ["owner/repo-a", "owner/repo-b"]        # TODO(adopt)
+      rules:
+        queued_threshold_minutes: 30   # queued longer = violation
+        fail_threshold: 0               # any failing check = violation
+        ignore_authors: ["app/dependabot", "dependabot[bot]"]
+      known_debt:
+        - { repo: "owner/repo-a", pr: 42, reason: "awaiting review",
+            expires: "2026-12-01" }                    # TODO(adopt)
+
+Verdict semantics:
+
+- ``gh pr checks --json bucket,state`` returns per-check buckets;
+  ``fail`` if ANY bucket is fail, ``pass`` only if ALL pass, else
+  ``queued`` (pending/skipping/mixed).
+- A PR stuck ``queued`` longer than ``queued_threshold_minutes`` is a
+  violation — usually means CI never started (runner offline, workflow
+  disabled), not that it's slow.
+- ``known_debt`` entries match on ``repo`` and optionally ``pr`` — a debt
+  scoped to one PR doesn't suppress violations on sibling PRs.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.alert import active_debts
+from lib.cmd import run as cmd_run
+from lib.jsonl import append as jsonl_append
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+YAML_PATH = Path(os.environ.get("PRS_YAML", ECOSYSTEM_ROOT / "prs.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+OUT_PATH = Path(os.environ.get("DRIFT_OUT", STATE_DIR / "drift.jsonl"))
+
+
+def gh_json(args: list[str], timeout: int = 60) -> list | dict | None:
+    rc, out, _e = cmd_run(["gh", *args], timeout=timeout)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out or "[]")
+    except Exception:
+        return None
+
+
+def classify(repo: str, number: int) -> str:
+    """pass | queued | fail | unknown — resolved from check buckets."""
+    raw = gh_json(["pr", "checks", str(number), "-R", repo,
+                   "--json", "bucket,state"])
+    if not isinstance(raw, list):
+        return "unknown"
+    if not raw:
+        return "queued"  # no checks reported yet
+    buckets = [c.get("bucket", "unknown") for c in raw]
+    if "fail" in buckets:
+        return "fail"
+    if all(b == "pass" for b in buckets):
+        return "pass"
+    return "queued"
+
+
+def check_pr(repo: str, p: dict, rules: dict, debts: list[dict],
+             now: datetime) -> dict:
+    """Evaluate one open PR; ALWAYS returns a record."""
+    number = p.get("number")
+    verdict = classify(repo, number)
+    # debt matches repo + optional pr — pr:null/absent = whole-repo waiver
+    debt = next((d for d in active_debts(debts, now,
+                                         match={"repo": repo})
+                 if d.get("pr") in (None, number)), None)
+    if debt is not None:
+        return {"class": "prs", "repo": repo, "pr": number,
+                "title": p.get("title"), "verdict": verdict,
+                "known_debt": debt.get("reason", ""),
+                "violations": [], "count": 0}
+    v: list[str] = []
+    if verdict == "fail":
+        v.append("fail")
+    if verdict == "queued":
+        try:
+            created = datetime.fromisoformat(
+                str(p.get("createdAt", "")).replace("Z", "+00:00"))
+            age_min = (now - created).total_seconds() / 60
+            if age_min > float(rules.get("queued_threshold_minutes", 30)):
+                v.append(f"queued={int(age_min)}m")
+        except Exception:
+            pass
+    return {"class": "prs", "repo": repo, "pr": number,
+            "title": p.get("title"), "verdict": verdict,
+            "violations": v, "count": len(v)}
+
+
+def main() -> int:
+    with open(YAML_PATH) as f:
+        cfg = yaml.safe_load(f)
+    section = (cfg or {}).get("prs") or {}
+    rules = section.get("rules", {})
+    debts = section.get("known_debt") or []
+    ignore = set(rules.get("ignore_authors", []))
+    ts = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    results = []
+    for repo in section.get("repos", []):
+        prs = gh_json(["pr", "list", "-R", repo, "--state", "open",
+                       "--limit", "100", "--json",
+                       "number,title,author,createdAt,updatedAt,"
+                       "headRefName"])
+        if not isinstance(prs, list):
+            prs = []
+        for p in prs:
+            login = (p.get("author") or {}).get("login", "")
+            if login in ignore:
+                continue
+            results.append(check_pr(repo, p, rules, debts, now))
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        r["ts"] = ts
+        jsonl_append(OUT_PATH, r)
+    print(f"drift-prs: {sum(r['count'] for r in results)} violations "
+          f"across {len(results)} PRs")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

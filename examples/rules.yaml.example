@@ -1,0 +1,79 @@
+# rules.yaml — operational compliance rules audited against session evidence.
+#
+# A compliance checker (e.g. state/bin/drift_compliance.py) replays each
+# rule's pattern/semantics over transcripts, guard logs and tool ledgers,
+# then writes verdicts (OK / VIOLATION / REVIEW / UNVERIFIABLE) to a JSONL
+# ledger — usually on a session-end hook plus periodic sweeps.
+#
+# Field reference:
+#   id                stable rule id (R1, R2, ...) — never reuse a retired id
+#   name              short human description of the rule
+#   severity          critical | high | medium | low
+#   source            where the rule comes from (policy doc, decision record)
+#   check_type        deterministic — pure regex/command over evidence
+#                     claims       — a claim type that REQUIRES prior
+#                                     verification evidence in the window
+#                     custom/hybrid— deterministic signal + semantic review
+#                     manual       — not machine-auditable (UNVERIFIABLE)
+#   evidence          which ledgers the rule may consult:
+#                     transcript | git-guard | drift-guard | executions | github
+#   pattern           regex for deterministic rules (command-position anchors
+#                     avoid matching prose ABOUT the rule)
+#   verify_pattern    regex that must appear BEFORE the claim (claims rules)
+#   verify_window     how many transcript chars before the claim count as
+#                     "prior evidence"
+#   validated_against list of session/run ids the rule was validated on —
+#                     keep [] until a validation pass; reviewers look here
+#   enforcement       human-readable statement of what counts as a violation
+#   note              reviewer guidance / known false-positive classes
+
+rules:
+  - id: R1
+    name: "no --admin merges"
+    severity: high
+    source: "team-policy.md#merges"
+    check_type: deterministic
+    validated_against: []
+    evidence: [transcript, git-guard]
+    pattern: 'gh\s+pr\s+merge.*--admin|gh\s+api.*merge.*admin'
+    note: "admin merges bypass branch protection; documented exceptions need a written reason"
+
+  - id: R2
+    name: "commits pushed before declaring done"
+    severity: high
+    source: "team-policy.md#handoff"
+    check_type: custom
+    validated_against: []
+    evidence: [transcript, github]
+    enforcement: "if the final report claims completion but the repo has unpushed commits or no open PR -> violation"
+    note: "composes with repos.yaml max_unpushed: 0; the 'done' claim is judged semantically"
+
+  - id: R3
+    name: "negative claims need search evidence"
+    severity: high
+    source: "lessons/claims-verification.md"
+    check_type: claims
+    validated_against: []
+    evidence: [transcript]
+    pattern: '(não\s+existe|does\s+not\s+exist|there\s+is\s+no|impossível|not\s+available)'
+    verify_pattern: '(grep|rg\s|find\s|code_search|web_search|memory_recall|obsidian_search|\[tool:)'
+    verify_window: 25000
+    enforcement: "claiming 'X does not exist' without a search/read tool call in the prior window is a violation"
+    note: "same failure class as false-green reports: absence of verification before the claim; window is in transcript characters"
+
+  - id: R4
+    name: "no secrets in commands or diffs"
+    severity: critical
+    source: "security-baseline.md"
+    check_type: deterministic
+    validated_against: []
+    evidence: [transcript]
+    redact_evidence: true
+    # Folded scalar keeps the BEGIN marker and the
+    # PRIVATE KEY suffix on separate source lines — line-based secret
+    # scanners (including this repo's own validate.sh) must not match
+    # the rule's own pattern text.
+    pattern: >-
+      (api[_-]?key|secret|token|password|BEGIN [A-Z ]*
+      PRIVATE KEY)\s*[:=]\s*['"][^'"]{8,}
+    note: "placeholders like <your-key> or example values are exempted by the checker; real-looking values are not"

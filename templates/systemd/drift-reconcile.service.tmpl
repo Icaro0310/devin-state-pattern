@@ -1,0 +1,36 @@
+# drift-reconcile.service — oneshot unit that runs the daily reconcile.
+#
+# WHY a oneshot+timer pair (not a cron line or a daemon):
+#   - Type=oneshot gives you journalctl logs per run, TimeoutStartSec as a
+#     hard bound (a hung probe can't wedge the schedule), and OnFailure=
+#     as a hook for alerting when the reconcile itself dies.
+#   - Persistent=true on the timer catches up after downtime/ suspend —
+#     a laptop closed at 03:00 runs the sweep at next boot.
+#
+# Install (user unit):
+#   mkdir -p ~/.config/systemd/user
+#   cp drift-reconcile.{service,timer} ~/.config/systemd/user/
+#   # TODO(adopt): fix ExecStart path below to YOUR reconcile script
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now drift-reconcile.timer
+#   systemctl --user list-timers drift-reconcile.timer   # verify
+#
+# TODO(adopt): replace <ECOSYSTEM_ROOT> with the absolute path of your
+# declared-state directory (the dir containing repos.yaml, drift_*.py,
+# and the reconcile entry script). systemd does NOT expand env vars in
+# ExecStart — use a literal path or a wrapper script.
+[Unit]
+Description=Drift reconcile — declared state vs reality sweep
+# hardening: the reconcile only reads system state and appends to its
+# own ledger; it never needs more than this
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Service]
+Type=oneshot
+# TODO(adopt): path to your reconcile entrypoint (shell script or python)
+ExecStart=%h/<ECOSYSTEM_ROOT>/bin/drift_reconcile.sh
+# Generous bound: N probes x timeout each; 10min covers ~10 repos.
+TimeoutStartSec=10min
+# TODO(adopt): optional failure notifier unit (see examples/ or your own)
+# OnFailure=drift-reconcile-failure.service

@@ -1,0 +1,24 @@
+# drift-reconcile.timer — daily trigger for the reconcile sweep.
+#
+# WHY daily at a fixed UTC hour: drift is a slow-moving signal — hourly
+# sweeps mostly re-measure the same state and double the alert noise.
+# 03:00 UTC is conventional (post-midnight, pre-workday) but pick a time
+# that doesn't collide with YOUR other heavy jobs (backups, scans).
+#
+# Persistent=true is the important flag: if the machine is off/asleep at
+# the scheduled time, systemd runs the unit at next opportunity instead
+# of skipping the day — drift coverage has no silent gaps.
+#
+# Install together with drift-reconcile.service.tmpl (same dir):
+#   systemctl --user enable --now drift-reconcile.timer
+[Unit]
+Description=Daily drift reconcile timer
+
+[Timer]
+# TODO(adopt): adjust OnCalendar to your preferred daily time (UTC).
+# Examples: *-*-* 03:00:00 UTC · *-*-* 04:30 UTC · Mon..Fri *-*-* 05:00 UTC
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

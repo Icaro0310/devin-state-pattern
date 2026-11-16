@@ -1,0 +1,66 @@
+# triggers.yaml — SIMPLIFIED trigger manifest.
+#
+# The full pattern keeps one entry per tool with nested trigger blocks,
+# expected cadence, evidence source, effect mode and fallback. This example
+# shows the minimal shape every entry needs: what fires, how often it
+# should fire, and how you prove it actually did.
+#
+# Vocabulary:
+#   kind               cron | systemd | hook | mcp | cli | manual
+#   expected cadence   3min | 5min | 15min | 30min | hourly | daily |
+#                      weekly | every-session | always-on | manual
+#   evidence.source    log | journalctl | file-mtime | executions |
+#                      gh-run | manual | none
+#   effect_mode        real | dry-run | report-only — dry-run/report-only
+#                      never counts as a failure to produce effects
+#
+# A trigger auditor classifies each entry as OK / SILENT (installed but no
+# observed run) / MISSING (declared but not installed) / PHANTOM (exists
+# but undeclared) / UNVERIFIABLE, using `expected` vs last observed run
+# and `staleness_factor` as the threshold.
+
+version: 1
+meta:
+  staleness_factor: 2        # SILENT when last run > 2x the expected cadence
+
+tools:
+  # --- scheduled jobs ----------------------------------------------------
+  - name: nightly-backup
+    kind: cron
+    schedule: "30 2 * * *"
+    expected: daily
+    last_run: "2026-01-15T02:30Z"        # optional: last observed run
+    evidence: { source: log, key: "logs/nightly-backup.log" }
+    notes: "writes a 'backup ok' line; file mtime is the cheapest signal"
+
+  - name: cache-warm
+    kind: systemd
+    unit: cache-warm.timer
+    schedule: "every 15min"
+    expected: 15min
+    evidence: { source: journalctl, key: cache-warm.service }
+    notes: "user-level timer; `systemctl --user list-timers` shows next elapse"
+
+  # --- event-driven -------------------------------------------------------
+  - name: session-end-hook
+    kind: hook
+    event: session-end
+    expected: every-session
+    evidence: { source: log, key: "logs/hooks/session-end.log" }
+    notes: "agent harness hook; fires after each session ends"
+
+  # --- always-on services ---------------------------------------------------
+  - name: metrics-bridge
+    kind: mcp
+    server: metrics
+    expected: always-on
+    evidence: { source: manual, key: "mcp tool call succeeds" }
+    notes: "MCP server declared in the agent's mcp config; no cadence to miss"
+
+  # --- on-demand ------------------------------------------------------------
+  - name: repo-doctor
+    kind: cli
+    invocation: "repo-doctor --all"
+    expected: manual
+    evidence: { source: log, key: "appends to the executions ledger" }
+    notes: "human/agent-invoked; expected: manual means no cadence alert"

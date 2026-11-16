@@ -1,0 +1,37 @@
+# prs.yaml — policy for open pull requests across the ecosystem.
+#
+# The PR drift check lists open PRs per repo and alerts when:
+#   * a PR sits queued/unchecked longer than queued_threshold_minutes
+#   * failing checks exceed fail_threshold
+#   * an author in ignore_authors shows up — those are handled by a
+#     different policy file (e.g. dependabot.yaml) and must not
+#     double-alert here.
+#
+# known_debt: exceptions with an expiry date (YYYY-MM-DD, UTC). While
+# 'expires' is in the future the entry suppresses the alert; afterwards the
+# PR violates again automatically — debt cannot be forgotten silently.
+# Always pair a debt entry with a reason AND an owner when possible.
+
+prs:
+  repos:
+    - example-org/webapp
+    - example-org/api
+    - example-org/worker
+    - example-org/docs-site
+
+  rules:
+    queued_threshold_minutes: 30   # alert if checks haven't reported by then
+    fail_threshold: 0              # alert on ANY failing required check
+    ignore_authors:
+      - "dependabot[bot]"
+      - "app/dependabot"           # covered by dependabot.yaml instead
+
+  known_debt:
+    - repo: example-org/webapp
+      pr: 42
+      reason: "checks pending — large migration PR still in progress"
+      expires: "2026-12-15"
+    - repo: example-org/api
+      pr: 17
+      reason: "failing check under investigation; owner: platform team"
+      expires: "2026-12-01"

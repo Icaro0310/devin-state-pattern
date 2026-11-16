@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""PreToolUse hook — deny destructive git ops on protected branches.
+
+WHY this hook exists
+--------------------
+"Don't rewrite shared history" is easy to agree with and easy to violate
+accidentally: ``git push --force`` with no refspec while sitting on
+``main``, ``git push origin --delete main``, ``git reset --hard`` on the
+trunk. Each is one keystroke away and each is (nearly) irreversible once
+pushed. A PreToolUse gate denies them at execution time; feature-branch
+workflow stays untouched.
+
+Scope table — what this hook GATES vs what stays rule-only:
+
+    GATED (deny, exit 2):
+      git push --force/-f/--force-with-lease*  -> main|master|protected
+      git push --delete/-d                     -> main|master|protected
+      git reset --hard                         -> when cwd branch is
+                                                 protected
+    ALLOWED (exit 0):
+      force-push on feature branches (normal rebase flow)
+      git reset --hard on feature branches / agent worktrees
+      push, fetch, pull, merge, commit — everything non-destructive
+    RULE-ONLY (not gated here — needs semantic/context judgment):
+      deleting OTHER people's branches, `git clean -fdx`, dropping
+      stashes, `git checkout -- .` on shared checkouts, force-push with
+      lease to a protected branch *with explicit owner approval*.
+      Those belong to the compliance audit (post-hoc) — a regex gate
+      can't weigh intent.
+
+Same harness contract as block-admin-merge: JSON payload on stdin,
+``{"permissionDecision": "deny"}`` + exit 2 on block, allow otherwise.
+
+Command-position discipline (same lesson as the merge gate): ``git``
+only counts at COMMAND position — start of segment, after env/sudo/nice
+prefixes and VAR=value assignments. ``git commit -m "... git push
+--force ..."`` is a string, not an execution. ``sh|bash|zsh -c`` wrappers
+are unwrapped one level so the inner command is checked too.
+
+Protected set is intentionally tiny (main|master + your declared
+trunk): gating feature branches would break normal rebase workflows.
+Extend PROTECTED via the protected_branches() hook below — e.g. read a
+``protected_branches:`` list from your declared-state YAML.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+PROTECTED = ("main", "master")
+# TODO(adopt): load extra protected branches from your declared-state
+# YAML (e.g. repos.yaml default_branch values) instead of hardcoding —
+# a repo whose trunk is `trunk` or `develop` must be covered too.
+
+# git at command position: segment start + env/sudo/nice/etc prefixes
+# and leading VAR=value assignments.
+_GIT_POS = re.compile(
+    r"^\s*(?:(?:sudo|env|nice|time|command|builtin|exec|xargs|nohup)"
+    r"\s+(?:-\S+\s+)*)*(?:[A-Za-z_]\w*=\S+\s+)*git\s+", re.IGNORECASE)
+_GIT_ANY = re.compile(r"\bgit\b")
+_PUSH = re.compile(r"\bpush\b", re.IGNORECASE)
+_PUSH_FORCE = re.compile(
+    r"(?:--force(?:-with-lease)?\b|-f\b|--force-with-lease\S*)",
+    re.IGNORECASE)
+_PUSH_DELETE = re.compile(r"--delete\b", re.IGNORECASE)
+_PUSH_DELETE_SHORT = re.compile(r"(?:^|\s)-d(?:\s|$)")
+_RESET_HARD = re.compile(r"\breset\b[^\n;|&]*--hard\b", re.IGNORECASE)
+# refspec targeting a protected branch: 'main', 'HEAD:main',
+# 'refs/heads/main', '+main' (force prefix on the ref itself)
+_REF_PROTECTED = re.compile(
+    r"(?:^|[\s:])\+?(?:refs/heads/)?(?:HEAD:)?("
+    + "|".join(re.escape(b) for b in PROTECTED) + r")\b",
+    re.IGNORECASE)
+_GIT_C = re.compile(r"\bgit\s+-C\s+(\S+)")
+# shell wrapper: sh|bash|zsh -c 'cmd' / "cmd" — inner command unwrapped
+_WRAPPER = re.compile(
+    r"^\s*(?:sudo\s+)?(?:env\s+\S+\s+)*(?:sh|bash|zsh)\s+-c\s+"
+    r"(['\"])(?P<inner>.*)\1\s*$", re.DOTALL)
+# push options that consume the NEXT token (so it isn't a refspec)
+_SKIP_NEXT = {"-o", "--push-option", "--receive-pack", "--exec",
+              "--repo", "--signed"}
+
+
+def _current_branch(cwd: str) -> str:
+    """Current branch of the checkout at ``cwd`` ('' if undeterminable —
+    callers treat '' as 'not provably protected' for reset --hard, but
+    refspec-targeted pushes are still gated)."""
+    if not cwd:
+        return ""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _segments(command: str) -> list[str]:
+    """Split on command separators — each segment is checked
+    independently (a benign `echo x && git push --force origin main`
+    still gates the second half)."""
+    return re.split(r"&&|\|\||[;|\n]", command)
+
+
+def _git_dir(seg: str, cwd: str) -> str:
+    """The repo a `git -C <path>` segment operates on, else payload cwd."""
+    m = _GIT_C.search(seg)
+    if m:
+        return os.path.expanduser(m.group(1).strip("'\""))
+    return cwd or ""
+
+
+def _positional_after_push(seg: str) -> list[str]:
+    """Non-flag tokens after `push` (remote + refspecs). Needed to tell
+    'push --force origin feature' (allowed) from bare 'push --force'
+    while ON a protected branch (denied — target is the current branch)."""
+    m = re.search(r"\bpush\b", seg, re.IGNORECASE)
+    if not m:
+        return []
+    toks = seg[m.end():].split()
+    positional, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _SKIP_NEXT:
+            i += 2
+            continue
+        if t.startswith("-"):
+            i += 1
+            continue
+        positional.append(t)
+        i += 1
+    return positional
+
+
+def _check(seg: str, cwd: str, depth: int = 0) -> str | None:
+    """Return deny-reason if this segment violates, else None."""
+    # 1) unwrap sh|bash|zsh -c '...' one level (depth-capped)
+    if depth < 2:
+        w = _WRAPPER.match(seg)
+        if w:
+            for inner in _segments(w.group("inner")):
+                reason = _check(inner.strip(), cwd, depth + 1)
+                if reason:
+                    return reason
+            return None
+
+    # 2) git must be at command position — otherwise it's an argument
+    #    or prose (commit message, echo string)
+    if not _GIT_POS.match(seg) or not _GIT_ANY.search(seg):
+        return None
+
+    gitdir = _git_dir(seg, cwd)
+    branch = _current_branch(gitdir) if gitdir else ""
+    on_protected = branch in PROTECTED
+
+    # push --delete/-d targeting a protected ref — always denied
+    if ((_PUSH.search(seg) and _PUSH_DELETE.search(seg))
+            or (_PUSH.search(seg) and _PUSH_DELETE_SHORT.search(seg))):
+        if _REF_PROTECTED.search(seg):
+            return ("git push --delete de branch protegida "
+                    "(main|master) é irreversível — proibido.")
+
+    if _PUSH.search(seg) and _PUSH_FORCE.search(seg):
+        if _REF_PROTECTED.search(seg):
+            return ("git push --force para main|master reescreve "
+                    "histórico público — proibido.")
+        positional = _positional_after_push(seg)
+        n_refspecs = max(0, len(positional) - 1)  # 1º = remote
+        if n_refspecs == 0 and on_protected:
+            return ("git push --force sem refspec explícito no branch "
+                    f"protegido '{branch}' — alvo é o branch actual, "
+                    "proibido.")
+        # force on feature branch / non-protected refspec: allowed
+
+    if _RESET_HARD.search(seg) and on_protected:
+        return (f"git reset --hard no branch protegido '{branch}' "
+                "destrói trabalho não commitado — proibido.")
+    return None
+
+
+def _extract_command(payload: dict) -> tuple[str, str]:
+    """-> (command, cwd). Same multi-shape extraction as the merge gate."""
+    tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+    cmd = ""
+    if isinstance(tool_input, dict):
+        c = tool_input.get("command")
+        if isinstance(c, str):
+            cmd = c
+    if not cmd:
+        for key in ("command", "cmd", "input", "shell", "script"):
+            val = payload.get(key)
+            if isinstance(val, str):
+                cmd = val
+                break
+    cwd = (payload.get("cwd") or payload.get("workspace")
+           or payload.get("working_directory") or "")
+    return cmd, cwd
+
+
+def _emit(decision: str, reason: str = "") -> None:
+    out = {"permissionDecision": decision}
+    if reason:
+        out["permissionDecisionReason"] = reason
+    print(json.dumps(out))
+    if decision == "deny":
+        print("BLOCKED (block-destructive-git): " + reason +
+              " Se a operação é realmente necessária e autorizada pelo "
+              "owner, executar manualmente fora do agente.",
+              file=sys.stderr)
+        sys.exit(2)
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    command, cwd = _extract_command(payload)
+    if not command:
+        _emit("allow")
+        return 0
+    for seg in _segments(command):
+        reason = _check(seg.strip(), cwd)
+        if reason:
+            _emit("deny", reason)
+            return 2
+    _emit("allow")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

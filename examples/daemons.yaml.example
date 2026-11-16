@@ -1,0 +1,64 @@
+# daemons.yaml — declare every scheduled job / long-running service in the
+# ecosystem and what "healthy" looks like for each one.
+#
+# The hosts: block comes first — named machines daemons run on.
+#   kind: local  → checked on this machine
+#   kind: ssh    → checked through `ssh <target>` (add port if non-standard)
+#
+# Each daemon entry:
+#   name               unique id used in drift reports
+#   host               key into the hosts: map
+#   kind               cron | systemd | systemd-user-timer | process | ...
+#   schedule           cron expression (kind: cron) — also used to detect
+#                      jobs that should have fired but did not (SILENT)
+#   unit               systemd unit name (kind: systemd*)
+#   expected           active | inactive | unknown
+#   marker             string expected in logs/output proving a run happened
+#   host_down_ok       true = unreachable host is known infra debt, NOT
+#                      daemon drift (don't page on a powered-off VM)
+#   expected_behavior  free text: what a correct run looks like — for humans
+#                      and for semantic checks on top of the deterministic
+#                      schedule/unit assertions.
+
+hosts:
+  workstation:
+    kind: local
+  build-vm:
+    kind: ssh
+    target: agent@192.0.2.10    # documentation-range IP — replace with yours
+    port: 22
+
+daemons:
+  # --- cron jobs -------------------------------------------------------
+  # The checker looks for the marker in `crontab -l` / /etc/cron.* AND in
+  # recent logs, so a deleted-but-referenced job is caught both ways.
+  - name: log-rotator
+    host: workstation
+    kind: cron
+    schedule: "15 3 * * *"
+    marker: log-rotator
+    expected_behavior: "rotates /var/log/example-app logs nightly, exits 0"
+
+  - name: index-rebuild
+    host: workstation
+    kind: cron
+    schedule: "0 */6 * * *"
+    marker: index-rebuild
+    expected_behavior: "rebuilds the search index; log line 'indexed N docs'"
+
+  # --- systemd user timers ----------------------------------------------
+  - name: cache-warmer
+    host: workstation
+    kind: systemd-user-timer
+    unit: cache-warmer.timer
+    expected: active
+    expected_behavior: "timer enabled; each run appends to cache-warm.log"
+
+  # --- systemd system services -------------------------------------------
+  - name: queue-worker
+    host: build-vm
+    kind: systemd
+    unit: queue-worker.service
+    expected: active
+    expected_behavior: "service active; consumes jobs from the work queue"
+    host_down_ok: true   # build-vm may be offline; unreachable host != drift

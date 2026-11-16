@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""drift-alert — turn the drift ledger into notifications.
+
+WHY this script exists
+----------------------
+The reconcilers write *every* measurement to ``drift.jsonl`` — including
+count=0 "all clean" rows and violations that appeared 5 minutes ago.
+Alerting naively on that stream pages the owner for transient blips and
+for issues already fixed. This script applies the alerting policy:
+
+- **latest-per-key wins** — only the most recent entry per
+  ``(class, identity)`` counts. A ``count=0`` row resolves the key; older
+  ``count>0`` rows are history, not alerts.
+- **persistence window** — a violation must survive ``persist_hours``
+  before it alerts (a dirty repo for 10 minutes is normal; for 24h it is
+  drift). The streak clock restarts on any clean row.
+- **lookback = 2x persist** — entries older than that are cut, which is
+  why the window must exceed persist_hours or first_seen can never
+  cross the threshold (real bug: lookback == persist meant nothing ever
+  alerted).
+- **dedup** — same key doesn't re-notify within ``dedup_hours``.
+- **quiet hours** — inside the configured UTC window, delivery defers
+  (state NOT marked — it retries next non-quiet run).
+- **known_debt** — declared, expiring acknowledgements suppress
+  matching violations while ``expires`` is in the future; the day after,
+  they resurface automatically. Debt without ``expires`` never expires —
+  use sparingly.
+
+Config (``reconciliation.yaml``)::
+
+    reconciliation:
+      alert:
+        persist_hours: 24
+        dedupe_window_minutes: 60
+        quiet_hours_utc: "23:00-07:00"     # optional; omit = never quiet
+      known_debt:                            # optional, top-level list
+        - { class: git, repo: my-repo, reason: "migration in progress",
+            expires: "2026-12-01" }
+
+Sinks: ``lib.alert.Alerter`` — WebhookSink via ``ALERT_WEBHOOK`` env,
+CommandSink via ``ALERT_COMMAND``, or print fallback. TODO(adopt): wire
+your real notifier (chat webhook, mail, pager) as a Sink.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import yaml
+
+from lib.alert import Alerter, WebhookSink, active_debts
+from lib.jsonl import iter_lines
+from lib.xdg import drift_state_dir
+
+ECOSYSTEM_ROOT = Path(os.environ.get(
+    "ECOSYSTEM_ROOT",
+    str(Path(__file__).resolve().parent.parent),
+))
+RECONCILE_YAML = Path(os.environ.get("RECONCILIATION_YAML",
+                                    ECOSYSTEM_ROOT / "reconciliation.yaml"))
+STATE_DIR = drift_state_dir(env_override="DRIFT_STATE_DIR")
+JSONL_PATH = Path(os.environ.get("DRIFT_JSONL",
+                                 STATE_DIR / "drift.jsonl"))
+ALERT_STATE = STATE_DIR / "drift-alert-state.json"
+
+
+def record_key(r: dict) -> tuple:
+    """Identity of a drift record for latest-per-key + dedup.
+
+    Order matters: class first (a 'git' violation and a 'deps' violation
+    on the same repo are different problems), then the most specific
+    identifier present (repo > daemon > check > pr > catch-all)."""
+    return (r.get("class") or "?",
+            r.get("repo") or r.get("daemon") or r.get("check")
+            or r.get("pr") or r.get("tool") or "?")
+
+
+def collect_persistent(jsonl_path: Path, persist_h: float,
+                       now: datetime) -> list[tuple]:
+    """-> [(key, record, hours_persistent)] for violations past the
+    persistence window.
+
+    Single pass: `latest[key]` = most recent record, `streak[key]` = ts
+    where the current run of count>0 began (reset by any count=0)."""
+    cutoff = now - timedelta(hours=persist_h * 2)  # see module docstring
+    latest: dict[tuple, tuple] = {}
+    streak: dict[tuple, datetime] = {}
+    for r in iter_lines(jsonl_path):
+        try:
+            t = datetime.fromisoformat(
+                str(r.get("ts", "")).replace("Z", "+00:00"))
+            cnt = int(r.get("count") or 0)
+        except Exception:
+            continue
+        if t < cutoff:
+            continue
+        key = record_key(r)
+        latest[key] = (t, r)
+        if cnt > 0:
+            streak.setdefault(key, t)
+        else:
+            streak.pop(key, None)
+
+    out = []
+    for key, (t_latest, r) in latest.items():
+        if int(r.get("count") or 0) <= 0:
+            continue
+        first_seen = streak.get(key, t_latest)
+        hours = (now - first_seen).total_seconds() / 3600
+        if hours >= persist_h:
+            out.append((key, r, int(hours)))
+    return out
+
+
+def debt_covers(debt_entries: list[dict], key: tuple,
+                record: dict, now: datetime) -> str:
+    """Return the debt reason when an ACTIVE known_debt entry matches
+    this violation; "" otherwise.
+
+    A debt entry matches when EVERY field it declares equals the
+    record's value (absent field = wildcard). Granularity is free:
+    ``{class: git}`` covers all git drift, ``{repo: X, pr: 42}`` pins one
+    PR. The key's identity string is accepted as an alias for repo/
+    daemon/check so terse declarations still work."""
+    cls, ident = key
+    candidates = {
+        "class": cls,
+        "repo": record.get("repo") or (ident if cls == "git" else None),
+        "daemon": record.get("daemon"),
+        "check": record.get("check"),
+        "pr": record.get("pr"),
+        "tool": record.get("tool"),
+    }
+    for d in active_debts(debt_entries, now):
+        declared = {k: v for k, v in d.items()
+                    if k in candidates and v is not None}
+        if not declared:
+            continue  # entry with no usable match fields — ignore
+        if all(str(candidates.get(k)) == str(v)
+               for k, v in declared.items()):
+            return str(d.get("reason") or "known debt")
+    return ""
+
+
+def build_alerter(cfg: dict) -> Alerter:
+    alert_cfg = (cfg.get("reconciliation") or {}).get("alert") or {}
+    quiet = alert_cfg.get("quiet_hours_utc")
+    dedup_min = float(alert_cfg.get("dedupe_window_minutes", 60))
+    # sink chain: explicit env wins; else webhook env; else print.
+    # TODO(adopt): prepend your real notifier here (e.g. CommandSink to a
+    # chat-cli script) — Alerter takes ONE sink, so compose if needed.
+    sink = None
+    if os.environ.get("ALERT_COMMAND"):
+        from lib.alert import CommandSink
+        sink = CommandSink(os.environ["ALERT_COMMAND"].split())
+    elif os.environ.get("ALERT_WEBHOOK"):
+        sink = WebhookSink()
+    return Alerter(state_path=ALERT_STATE, sink=sink,
+                   dedup_hours=dedup_min / 60.0,
+                   quiet_hours=quiet, state_dir=STATE_DIR)
+
+
+def main() -> int:
+    if not JSONL_PATH.exists():
+        print("drift_alert: nothing")
+        return 0
+    try:
+        with open(RECONCILE_YAML) as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"drift_alert: FATAL config: {e}", file=sys.stderr)
+        return 0  # fail-open
+    alert_cfg = (cfg.get("reconciliation") or {}).get("alert") or {}
+    persist_h = float(os.environ.get(
+        "DRIFT_PERSIST_OVERRIDE", alert_cfg.get("persist_hours", 24)))
+    debts = (cfg.get("reconciliation") or {}).get("known_debt") \
+        or cfg.get("known_debt") or []
+    now = datetime.now(timezone.utc)
+
+    alerter = build_alerter(cfg)
+    candidates = collect_persistent(JSONL_PATH, persist_h, now)
+
+    to_alert = []
+    suppressed = []
+    for key, record, hours in candidates:
+        reason = debt_covers(debts, key, record, now)
+        if reason:
+            suppressed.append((key, reason))
+            continue
+        if alerter.recently_sent("|".join(str(x) for x in key), now):
+            continue
+        to_alert.append((key, record, hours))
+
+    if suppressed:
+        print(f"drift_alert: {len(suppressed)} suppressed by known_debt")
+
+    if not to_alert:
+        print("drift_alert: no persistent violations")
+        return 0
+
+    # aggregate by class — one message, violations grouped, capped so a
+    # mass-drift event can't produce an unreadable wall of text
+    by_class: dict[str, list] = {}
+    for key, record, hours in to_alert:
+        by_class.setdefault(key[0], []).append((key, record, hours))
+    lines = [f"Drift alert — violações persistentes >{persist_h:g}h:"]
+    for cls in sorted(by_class):
+        lines.append(f"  [{cls}]")
+        for key, record, hours in sorted(
+                by_class[cls], key=lambda x: -x[2])[:10]:
+            ident = key[1]
+            viol = record.get("violations") or []
+            lines.append(f"    {ident} ha {hours}h: {viol}")
+        if len(by_class[cls]) > 10:
+            lines.append(f"    … +{len(by_class[cls]) - 10} mais")
+    msg = "\n".join(lines)
+    if len(msg) > 3500:
+        msg = msg[:3490] + "..."
+
+    if alerter.is_quiet(now):
+        print("drift_alert: in quiet hours, deferring")
+        return 0
+    if not alerter.send_raw("warn", msg):
+        print("drift_alert: alert-undelivered", file=sys.stderr)
+        # fail-open observability: record the delivery failure in the
+        # ledger so 'alert sent?' is answerable later
+        try:
+            from lib.jsonl import append as _app
+            _app(JSONL_PATH, {"ts": now.isoformat(), "class": "alert",
+                              "alert-undelivered": msg[:500]})
+        except Exception:
+            pass
+        return 0
+    for key, _record, _hours in to_alert:
+        alerter.mark_sent("|".join(str(x) for x in key), now)
+    print(f"drift_alert: sent ({len(to_alert)} persistent violations)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

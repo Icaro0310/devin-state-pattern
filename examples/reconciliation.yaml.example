@@ -1,0 +1,53 @@
+# reconciliation.yaml — how often declared state is reconciled, which
+# drift classes run, what may be auto-fixed, and how alerts go out.
+#
+# A reconciler (cron job, systemd timer or scheduled CI run) reads this
+# file, runs each enabled class, applies the auto_fix policy, then emits
+# alerts for whatever is still violated. Keep `schedule` in sync with the
+# actual timer — drift checks flag a stale last-run.
+
+reconciliation:
+  schedule: "0 3 * * *"      # daily at 03:00 — cron expression
+  timezone: "UTC"
+
+  # Drift classes — each maps to a checker (state/bin/drift_*.py or your
+  # equivalent). enabled: false keeps the class declared but paused, which
+  # is better than deleting it: the manifest still documents intent.
+  classes:
+    git:        { enabled: true,  checker: drift_git.py }         # repos.yaml limits
+    spec:       { enabled: true,  checker: drift_spec.py }        # fleet.yaml pins
+    deps:       { enabled: true,  checker: drift_deps.py }        # dependabot/prs policy
+    daemons:    { enabled: true,  checker: drift_daemons.py }     # daemons.yaml
+    prs:        { enabled: true,  checker: drift_prs.py }         # prs.yaml
+    triggers:   { enabled: true,  checker: drift_triggers.py }    # triggers.yaml
+    compliance: { enabled: true,  checker: drift_compliance.py }  # rules.yaml
+    harness:    { enabled: false, checker: drift_harness.py }     # optional runtime state
+
+  # Auto-fix policy, keyed by checker name. Anything NOT listed here is
+  # observe-only: the reconciler reports but never mutates. Prefer
+  # observe-only until a class has earned trust — auto-fix on top of a
+  # wrong checker destroys real state.
+  auto_fix:
+    drift-git:
+      prune_orphan_worktrees_when_zero_diff: true
+      drop_stashes_older_than_days: 7
+      drop_when_zero_diff: true
+    drift-spec:
+      align_dev_venvs: true
+      reinstall_uv_tools: true
+    drift-deps:
+      auto_rebase_when_older_than_hours: 72
+    drift-daemons:
+      restart: false                     # observe-only: never restart services
+    drift-prs:
+      approve_if_green_and_queued_lt_minutes: 30
+    # drift-triggers intentionally absent — triggers are declared and
+    # audited, never auto-installed or auto-removed.
+
+  # Alerting — where violations go and how they are deduplicated so a
+  # persistent violation pages once, not every run.
+  alert:
+    channels: [slack]                    # or webhook / email / matrix / none
+    persist_hours: 24                    # keep alerting until state is clean
+    dedupe_window_minutes: 60            # don't re-send the same violation
+    quiet_hours_utc: "23:00-07:00"       # no pages overnight (UTC)
